@@ -156,6 +156,23 @@ option(VELOX_ENABLE_ABFS "Build Abfs Connector" OFF)
 option(VELOX_ENABLE_HDFS "Build Hdfs Connector" OFF)
 option(VELOX_ENABLE_PARQUET "Enable Parquet support" ON)
 option(VELOX_ENABLE_ARROW "Enable Arrow support" OFF)
+option(VELOX_ENABLE_WASM_UDF "Enable WebAssembly scalar and aggregate UDF support" OFF)
+option(VELOX_ENABLE_JAVA_UDF "Enable Java scalar and aggregate UDF support" OFF)
+option(
+  VELOX_BUILD_WASM_UDF_TESTING
+  "Build the standalone WebAssembly UDF end-to-end test"
+  OFF
+)
+option(
+  VELOX_BUILD_JAVA_UDF_TESTING
+  "Build the standalone Java UDF end-to-end test"
+  OFF
+)
+option(
+  VELOX_BUILD_UDF_BENCHMARKS
+  "Build the Java versus WebAssembly UDF comparison benchmarks"
+  OFF
+)
 option(VELOX_ENABLE_GEO "Enable Geospatial support" ON)
 option(VELOX_ENABLE_REMOTE_FUNCTIONS "Enable remote function support" OFF)
 option(VELOX_ENABLE_CCACHE "Use ccache if installed." ON)
@@ -175,6 +192,26 @@ option(VELOX_SIMDJSON_SKIPUTF8VALIDATION "Skip simdjson utf8 validation in JSON 
 option(VELOX_ENABLE_FAISS "Build faiss vector search support" OFF)
 option(VELOX_ENABLE_TORCHWAVE "Build TorchWave experimental subsystem." OFF)
 option(VELOX_ENABLE_CXL "Build CXL experimental memory subsystem (Linux only)." OFF)
+
+if(VELOX_BUILD_UDF_BENCHMARKS)
+  set(VELOX_ENABLE_WASM_UDF ON)
+  set(VELOX_ENABLE_JAVA_UDF ON)
+endif()
+
+if(VELOX_ENABLE_WASM_UDF)
+  # WebAssembly UDF batches are exchanged as Arrow IPC streams.
+  set(VELOX_ENABLE_ARROW ON)
+endif()
+
+if(VELOX_ENABLE_JAVA_UDF OR VELOX_BUILD_JAVA_UDF_TESTING)
+  # Java UDF batches are exchanged as Arrow IPC streams.
+  set(VELOX_ENABLE_ARROW ON)
+  set(VELOX_ENABLE_JAVA_UDF ON)
+endif()
+
+if(VELOX_BUILD_WASM_UDF_TESTING OR VELOX_BUILD_JAVA_UDF_TESTING)
+  enable_testing()
+endif()
 
 # Explicitly force compilers to generate colored output. Compilers usually do
 # this by default if they detect the output is a terminal, but this assumption
@@ -843,6 +880,17 @@ message("FINAL CMAKE_EXE_LINKER_FLAGS=${CMAKE_EXE_LINKER_FLAGS}")
 if(VELOX_ENABLE_ARROW)
   velox_set_source(Arrow)
   velox_resolve_dependency(Arrow)
+endif()
+
+if(VELOX_ENABLE_WASM_UDF)
+  find_package(Wasmtime 39 REQUIRED)
+  if(Wasmtime_VERSION VERSION_GREATER_EQUAL 40)
+    message(FATAL_ERROR "WebAssembly UDF support requires Wasmtime 39.x")
+  endif()
+endif()
+
+if(VELOX_ENABLE_JAVA_UDF)
+  find_package(JNI REQUIRED COMPONENTS JVM)
 endif()
 
 if(VELOX_ENABLE_GEO)

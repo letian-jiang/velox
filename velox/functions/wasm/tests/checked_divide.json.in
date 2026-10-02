@@ -1,0 +1,14 @@
+{
+  "abi_version": 1,
+  "name": "checked_divide",
+  "kind": "scalar",
+  "wasm": "@WASM_EXAMPLE_PATH@",
+  "entrypoint": "checked_divide",
+  "arguments": [
+    {"type": "bigint", "nullable": false},
+    {"type": "bigint", "nullable": false}
+  ],
+  "return": {"type": "bigint", "nullable": false},
+  "deterministic": true,
+  "default_null_behavior": true
+}

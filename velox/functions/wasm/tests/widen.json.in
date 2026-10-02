@@ -1,0 +1,15 @@
+{
+  "abi_version": 1,
+  "name": "widen",
+  "kind": "scalar",
+  "wasm": "@WASM_EXAMPLE_PATH@",
+  "entrypoint": "widen",
+  "arguments": [
+    {"type": "tinyint", "nullable": false},
+    {"type": "smallint", "nullable": false},
+    {"type": "integer", "nullable": false}
+  ],
+  "return": {"type": "bigint", "nullable": false},
+  "deterministic": true,
+  "default_null_behavior": true
+}

@@ -1,0 +1,11 @@
+{
+  "abi_version": 1,
+  "name": "not_bool",
+  "kind": "scalar",
+  "wasm": "@WASM_EXAMPLE_PATH@",
+  "entrypoint": "not",
+  "arguments": [{"type": "boolean", "nullable": false}],
+  "return": {"type": "boolean", "nullable": false},
+  "deterministic": true,
+  "default_null_behavior": true
+}

@@ -1,0 +1,59 @@
+{
+  "abi_version": 1,
+  "name": "java_profile_transform",
+  "kind": "scalar",
+  "jar": "target/velox-java-examples-1.0-SNAPSHOT.jar",
+  "class": "io.velox.udf.examples.ProfileTransform",
+  "arguments": [
+    {
+      "type": "row",
+      "nullable": true,
+      "fields": [
+        {"name": "name", "type": {"type": "varchar", "nullable": false}},
+        {
+          "name": "scores",
+          "type": {
+            "type": "array",
+            "nullable": false,
+            "element": {"type": "bigint", "nullable": true}
+          }
+        },
+        {
+          "name": "labels",
+          "type": {
+            "type": "map",
+            "nullable": false,
+            "key": {"type": "varchar", "nullable": false},
+            "value": {"type": "bigint", "nullable": true}
+          }
+        }
+      ]
+    }
+  ],
+  "return": {
+    "type": "row",
+    "nullable": true,
+    "fields": [
+      {"name": "name", "type": {"type": "varchar", "nullable": false}},
+      {
+        "name": "scores",
+        "type": {
+          "type": "array",
+          "nullable": false,
+          "element": {"type": "bigint", "nullable": true}
+        }
+      },
+      {
+        "name": "labels",
+        "type": {
+          "type": "map",
+          "nullable": false,
+          "key": {"type": "varchar", "nullable": false},
+          "value": {"type": "bigint", "nullable": true}
+        }
+      }
+    ]
+  },
+  "deterministic": true,
+  "default_null_behavior": false
+}

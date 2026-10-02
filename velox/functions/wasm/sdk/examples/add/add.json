@@ -1,0 +1,14 @@
+{
+  "abi_version": 1,
+  "name": "add_i64",
+  "kind": "scalar",
+  "wasm": "../../target/wasm32-unknown-unknown/release/velox_wasm_example_add.wasm",
+  "entrypoint": "add_i64",
+  "arguments": [
+    {"type": "bigint", "nullable": false},
+    {"type": "bigint", "nullable": false}
+  ],
+  "return": {"type": "bigint", "nullable": false},
+  "deterministic": true,
+  "default_null_behavior": true
+}

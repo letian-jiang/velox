@@ -1,0 +1,22 @@
+{
+  "abi_version": 1,
+  "name": "avg_f64",
+  "kind": "aggregate",
+  "wasm": "@WASM_EXAMPLE_PATH@",
+  "entrypoints": {
+    "create": "avg_f64_create_batch",
+    "destroy": "avg_f64_destroy_batch",
+    "update": "avg_f64_update_batch",
+    "update_single_group": "avg_f64_update_single_group_batch",
+    "serialize": "avg_f64_serialize_batch",
+    "merge": "avg_f64_merge_batch",
+    "merge_single_group": "avg_f64_merge_single_group_batch",
+    "finalize": "avg_f64_finalize_batch"
+  },
+  "arguments": [{"type": "double", "nullable": true}],
+  "intermediate": {"type": "varbinary", "nullable": true},
+  "return": {"type": "double", "nullable": true},
+  "order_sensitive": false,
+  "ignore_duplicates": false,
+  "default_null_behavior": false
+}

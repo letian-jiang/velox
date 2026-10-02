@@ -1,0 +1,11 @@
+{
+  "abi_version": 1,
+  "name": "binary_length",
+  "kind": "scalar",
+  "wasm": "@WASM_EXAMPLE_PATH@",
+  "entrypoint": "binary_length",
+  "arguments": [{"type": "varbinary", "nullable": false}],
+  "return": {"type": "integer", "nullable": false},
+  "deterministic": true,
+  "default_null_behavior": true
+}

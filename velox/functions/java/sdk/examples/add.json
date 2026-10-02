@@ -1,0 +1,14 @@
+{
+  "abi_version": 1,
+  "name": "java_add",
+  "kind": "scalar",
+  "jar": "target/velox-java-examples-1.0-SNAPSHOT.jar",
+  "class": "io.velox.udf.examples.Add",
+  "arguments": [
+    {"type": "bigint", "nullable": false},
+    {"type": "bigint", "nullable": false}
+  ],
+  "return": {"type": "bigint", "nullable": false},
+  "deterministic": true,
+  "default_null_behavior": true
+}

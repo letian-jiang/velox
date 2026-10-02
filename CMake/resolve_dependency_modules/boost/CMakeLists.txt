@@ -49,13 +49,6 @@ FetchContent_Declare(
   URL_HASH ${VELOX_BOOST_BUILD_SHA256_CHECKSUM}
 )
 
-# Configure the file before adding the header only libs
-configure_file(
-  ${CMAKE_CURRENT_LIST_DIR}/FindBoost.cmake.in
-  ${CMAKE_CURRENT_LIST_DIR}/FindBoost.cmake
-  @ONLY
-)
-
 set(
   BOOST_HEADER_ONLY
   crc
@@ -69,6 +62,13 @@ set(
   variant
 )
 list(APPEND BOOST_INCLUDE_LIBRARIES ${BOOST_HEADER_ONLY})
+list(APPEND BOOST_INCLUDE_LIBRARIES ${BOOST_COMPONENTS})
+
+configure_file(
+  ${CMAKE_CURRENT_LIST_DIR}/FindBoost.cmake.in
+  ${CMAKE_CURRENT_LIST_DIR}/FindBoost.cmake
+  @ONLY
+)
 
 # The `headers` target is not created by Boost cmake and leads to a warning
 list(REMOVE_ITEM BOOST_INCLUDE_LIBRARIES headers)

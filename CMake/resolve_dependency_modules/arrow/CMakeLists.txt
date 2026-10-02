@@ -40,7 +40,7 @@ if(VELOX_ENABLE_ARROW)
     -DARROW_SIMD_LEVEL=NONE
     -DARROW_RUNTIME_SIMD_LEVEL=NONE
     -DARROW_WITH_UTF8PROC=OFF
-    -DARROW_TESTING=ON
+    -DARROW_TESTING=${VELOX_BUILD_TESTING}
     -DCMAKE_INSTALL_LIBDIR=lib
     -DCMAKE_INSTALL_PREFIX=${ARROW_PREFIX}/install
     -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
@@ -78,32 +78,30 @@ if(VELOX_ENABLE_ARROW)
     URL_HASH ${VELOX_ARROW_BUILD_SHA256_CHECKSUM}
     SOURCE_SUBDIR cpp
     CMAKE_ARGS ${ARROW_CMAKE_ARGS}
-    BUILD_BYPRODUCTS ${ARROW_LIBDIR}/libarrow.a ${ARROW_LIBDIR}/libarrow_testing.a
+    BUILD_BYPRODUCTS ${ARROW_LIBDIR}/libarrow.a
     PATCH_COMMAND
       patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/cmake-compatibility.patch && patch -p1 -i
       ${CMAKE_CURRENT_LIST_DIR}/arrow-testing-boost.patch
   )
 
   add_library(arrow STATIC IMPORTED GLOBAL)
-  add_library(arrow_testing STATIC IMPORTED GLOBAL)
   add_dependencies(arrow arrow_ep)
-  add_dependencies(arrow_testing arrow)
   file(MAKE_DIRECTORY ${ARROW_PREFIX}/install/include)
   set_target_properties(
     arrow
-    arrow_testing
     PROPERTIES INTERFACE_INCLUDE_DIRECTORIES ${ARROW_PREFIX}/install/include
   )
   set_target_properties(arrow PROPERTIES IMPORTED_LOCATION ${ARROW_LIBDIR}/libarrow.a)
   set_property(TARGET arrow PROPERTY INTERFACE_LINK_LIBRARIES ${RE2})
-  # Mirror the path-based interface dep from CMake/FindArrow.cmake — see
-  # the SYSTEM-arrow comment there for the ODR-violation rationale that
-  # forces us to use ${ARROW_LIBDIR}/libarrow.a (path) instead of the
-  # `arrow` target name.
-  set_target_properties(
-    arrow_testing
-    PROPERTIES
-      IMPORTED_LOCATION ${ARROW_LIBDIR}/libarrow_testing.a
-      INTERFACE_LINK_LIBRARIES ${ARROW_LIBDIR}/libarrow.a
-  )
+  if(VELOX_BUILD_TESTING)
+    add_library(arrow_testing STATIC IMPORTED GLOBAL)
+    add_dependencies(arrow_testing arrow)
+    set_target_properties(
+      arrow_testing
+      PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES ${ARROW_PREFIX}/install/include
+        IMPORTED_LOCATION ${ARROW_LIBDIR}/libarrow_testing.a
+        INTERFACE_LINK_LIBRARIES ${ARROW_LIBDIR}/libarrow.a
+    )
+  endif()
 endif()

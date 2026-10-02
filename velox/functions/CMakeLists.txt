@@ -29,6 +29,14 @@ if(${VELOX_ENABLE_REMOTE_FUNCTIONS})
   add_subdirectory(remote)
 endif()
 
+if(${VELOX_ENABLE_WASM_UDF})
+  add_subdirectory(wasm)
+endif()
+
+if(${VELOX_ENABLE_JAVA_UDF})
+  add_subdirectory(java)
+endif()
+
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
 endif()

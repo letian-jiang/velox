@@ -1,0 +1,13 @@
+{
+  "abi_version": 1,
+  "name": "java_sum_long",
+  "kind": "aggregate",
+  "jar": "target/velox-java-examples-1.0-SNAPSHOT.jar",
+  "class": "io.velox.udf.examples.SumLong",
+  "arguments": [{"type": "bigint", "nullable": true}],
+  "intermediate": {"type": "varbinary", "nullable": true},
+  "return": {"type": "bigint", "nullable": true},
+  "order_sensitive": false,
+  "ignore_duplicates": false,
+  "default_null_behavior": false
+}

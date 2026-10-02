@@ -1,0 +1,14 @@
+{
+  "abi_version": 1,
+  "name": "hypotenuse",
+  "kind": "scalar",
+  "wasm": "@WASM_EXAMPLE_PATH@",
+  "entrypoint": "hypotenuse",
+  "arguments": [
+    {"type": "real", "nullable": false},
+    {"type": "double", "nullable": false}
+  ],
+  "return": {"type": "double", "nullable": false},
+  "deterministic": true,
+  "default_null_behavior": true
+}

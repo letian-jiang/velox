@@ -1,0 +1,12 @@
+[package]
+name = "velox-wasm-example-add"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+roaring = "0.10.12"
+velox-wasm-sdk = { path = "../../velox-wasm-sdk" }

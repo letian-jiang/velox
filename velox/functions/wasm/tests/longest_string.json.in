@@ -1,0 +1,22 @@
+{
+  "abi_version": 1,
+  "name": "longest_string",
+  "kind": "aggregate",
+  "wasm": "@WASM_EXAMPLE_PATH@",
+  "entrypoints": {
+    "create": "longest_string_create_batch",
+    "destroy": "longest_string_destroy_batch",
+    "update": "longest_string_update_batch",
+    "update_single_group": "longest_string_update_single_group_batch",
+    "serialize": "longest_string_serialize_batch",
+    "merge": "longest_string_merge_batch",
+    "merge_single_group": "longest_string_merge_single_group_batch",
+    "finalize": "longest_string_finalize_batch"
+  },
+  "arguments": [{"type": "varchar", "nullable": true}],
+  "intermediate": {"type": "varbinary", "nullable": true},
+  "return": {"type": "varchar", "nullable": true},
+  "order_sensitive": false,
+  "ignore_duplicates": true,
+  "default_null_behavior": false
+}

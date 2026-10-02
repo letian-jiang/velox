@@ -1,0 +1,11 @@
+{
+  "abi_version": 1,
+  "name": "next_date",
+  "kind": "scalar",
+  "wasm": "@WASM_EXAMPLE_PATH@",
+  "entrypoint": "next_date",
+  "arguments": [{"type": "date", "nullable": false}],
+  "return": {"type": "date", "nullable": false},
+  "deterministic": true,
+  "default_null_behavior": true
+}

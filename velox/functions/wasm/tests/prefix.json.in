@@ -1,0 +1,14 @@
+{
+  "abi_version": 1,
+  "name": "prefix",
+  "kind": "scalar",
+  "wasm": "@WASM_EXAMPLE_PATH@",
+  "entrypoint": "prefix",
+  "arguments": [
+    {"type": "varchar", "nullable": false},
+    {"type": "varchar", "nullable": true}
+  ],
+  "return": {"type": "varchar", "nullable": true},
+  "deterministic": true,
+  "default_null_behavior": false
+}

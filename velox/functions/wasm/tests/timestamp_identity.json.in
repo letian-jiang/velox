@@ -1,0 +1,11 @@
+{
+  "abi_version": 1,
+  "name": "timestamp_identity",
+  "kind": "scalar",
+  "wasm": "@WASM_EXAMPLE_PATH@",
+  "entrypoint": "timestamp_identity",
+  "arguments": [{"type": "timestamp", "nullable": false}],
+  "return": {"type": "timestamp", "nullable": false},
+  "deterministic": true,
+  "default_null_behavior": true
+}

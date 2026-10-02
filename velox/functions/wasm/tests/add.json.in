@@ -1,0 +1,14 @@
+{
+  "abi_version": 1,
+  "name": "add_i64",
+  "kind": "scalar",
+  "wasm": "@WASM_EXAMPLE_PATH@",
+  "entrypoint": "add_i64_batch",
+  "arguments": [
+    {"type": "bigint", "nullable": false},
+    {"type": "bigint", "nullable": false}
+  ],
+  "return": {"type": "bigint", "nullable": false},
+  "deterministic": true,
+  "default_null_behavior": true
+}

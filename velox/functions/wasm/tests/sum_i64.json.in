@@ -1,0 +1,22 @@
+{
+  "abi_version": 1,
+  "name": "sum_i64",
+  "kind": "aggregate",
+  "wasm": "@WASM_EXAMPLE_PATH@",
+  "entrypoints": {
+    "create": "sum_i64_create_batch",
+    "destroy": "sum_i64_destroy_batch",
+    "update": "sum_i64_update_batch",
+    "update_single_group": "sum_i64_update_single_group_batch",
+    "serialize": "sum_i64_serialize_batch",
+    "merge": "sum_i64_merge_batch",
+    "merge_single_group": "sum_i64_merge_single_group_batch",
+    "finalize": "sum_i64_finalize_batch"
+  },
+  "arguments": [{"type": "bigint", "nullable": true}],
+  "intermediate": {"type": "varbinary", "nullable": true},
+  "return": {"type": "bigint", "nullable": true},
+  "order_sensitive": false,
+  "ignore_duplicates": false,
+  "default_null_behavior": false
+}
