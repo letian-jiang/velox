@@ -839,7 +839,6 @@ std::vector<VectorPtr> extractArgColumns(
     const core::CallTypedExprPtr& aggregateExpr,
     const RowVectorPtr& input,
     memory::MemoryPool* pool) {
-  auto& type = input->type()->asRow();
   std::vector<VectorPtr> columns;
   for (const auto& arg : aggregateExpr->inputs()) {
     if (auto field = core::TypedExprs::asFieldAccess(arg)) {
@@ -848,13 +847,6 @@ std::vector<VectorPtr> extractArgColumns(
     if (core::TypedExprs::isConstant(arg)) {
       auto constant = core::TypedExprs::asConstant(arg);
       columns.push_back(constant->toConstantVector(pool));
-    }
-    if (auto lambda = core::TypedExprs::asLambda(arg)) {
-      for (const auto& name : lambda->signature()->names()) {
-        if (auto captureIndex = type.getChildIdxIfExists(name)) {
-          columns.push_back(input->childAt(captureIndex.value()));
-        }
-      }
     }
   }
   return columns;

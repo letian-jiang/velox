@@ -135,6 +135,7 @@ set(
   "Specify whether to find the gflags package as a shared or static package"
 )
 option(VELOX_ENABLE_EXEC "Build exec." ON)
+option(VELOX_ENABLE_RPC "Build RPC operators." ON)
 option(VELOX_ENABLE_AGGREGATES "Build aggregates." ON)
 option(VELOX_ENABLE_HIVE_CONNECTOR "Build Hive connector." ON)
 option(VELOX_ENABLE_TPCH_CONNECTOR "Build TPC-H connector." ON)
@@ -157,20 +158,14 @@ option(VELOX_ENABLE_HDFS "Build Hdfs Connector" OFF)
 option(VELOX_ENABLE_PARQUET "Enable Parquet support" ON)
 option(VELOX_ENABLE_ARROW "Enable Arrow support" OFF)
 option(VELOX_ENABLE_WASM_UDF "Enable WebAssembly scalar and aggregate UDF support" OFF)
-option(VELOX_ENABLE_JAVA_UDF "Enable Java scalar and aggregate UDF support" OFF)
 option(
   VELOX_BUILD_WASM_UDF_TESTING
   "Build the standalone WebAssembly UDF end-to-end test"
   OFF
 )
 option(
-  VELOX_BUILD_JAVA_UDF_TESTING
-  "Build the standalone Java UDF end-to-end test"
-  OFF
-)
-option(
   VELOX_BUILD_UDF_BENCHMARKS
-  "Build the Java versus WebAssembly UDF comparison benchmarks"
+  "Build WebAssembly UDF versus native Velox function benchmarks"
   OFF
 )
 option(VELOX_ENABLE_GEO "Enable Geospatial support" ON)
@@ -195,7 +190,8 @@ option(VELOX_ENABLE_CXL "Build CXL experimental memory subsystem (Linux only)." 
 
 if(VELOX_BUILD_UDF_BENCHMARKS)
   set(VELOX_ENABLE_WASM_UDF ON)
-  set(VELOX_ENABLE_JAVA_UDF ON)
+  set(VELOX_ENABLE_PRESTO_FUNCTIONS ON)
+  set(VELOX_ENABLE_EXPRESSION ON)
 endif()
 
 if(VELOX_ENABLE_WASM_UDF)
@@ -203,13 +199,7 @@ if(VELOX_ENABLE_WASM_UDF)
   set(VELOX_ENABLE_ARROW ON)
 endif()
 
-if(VELOX_ENABLE_JAVA_UDF OR VELOX_BUILD_JAVA_UDF_TESTING)
-  # Java UDF batches are exchanged as Arrow IPC streams.
-  set(VELOX_ENABLE_ARROW ON)
-  set(VELOX_ENABLE_JAVA_UDF ON)
-endif()
-
-if(VELOX_BUILD_WASM_UDF_TESTING OR VELOX_BUILD_JAVA_UDF_TESTING)
+if(VELOX_BUILD_WASM_UDF_TESTING OR VELOX_BUILD_UDF_BENCHMARKS)
   enable_testing()
 endif()
 
@@ -728,7 +718,8 @@ if(${VELOX_BUILD_TESTING})
   velox_resolve_dependency(gRPC)
 endif()
 
-if(VELOX_ENABLE_REMOTE_FUNCTIONS OR VELOX_ENABLE_PARQUET)
+if(VELOX_ENABLE_REMOTE_FUNCTIONS OR VELOX_ENABLE_PARQUET OR
+   (VELOX_ENABLE_EXEC AND VELOX_ENABLE_RPC))
   # TODO: Move this to use resolve_dependency(). For some reason, FBThrift
   # requires clients to explicitly install fizz and wangle.
   find_package(fizz CONFIG REQUIRED)
@@ -887,10 +878,6 @@ if(VELOX_ENABLE_WASM_UDF)
   if(Wasmtime_VERSION VERSION_GREATER_EQUAL 40)
     message(FATAL_ERROR "WebAssembly UDF support requires Wasmtime 39.x")
   endif()
-endif()
-
-if(VELOX_ENABLE_JAVA_UDF)
-  find_package(JNI REQUIRED COMPONENTS JVM)
 endif()
 
 if(VELOX_ENABLE_GEO)

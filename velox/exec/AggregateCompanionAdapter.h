@@ -36,6 +36,12 @@ class AggregateCompanionFunctionBase : public Aggregate {
 
   bool isFixedSize() const override final;
 
+  bool supportsCompact() const override final;
+
+  uint64_t compact(folly::Range<char**> groups) override final;
+
+  void setConstantInputs(const std::vector<VectorPtr>& inputs) override final;
+
   void destroy(folly::Range<char**> groups) override final;
 
   void initializeNewGroups(
@@ -181,8 +187,21 @@ struct AggregateCompanionAdapter {
 /// found in
 /// https://github.com/facebookincubator/velox/pull/11999#issuecomment-3274577979
 /// and https://github.com/facebookincubator/velox/issues/12830.
+struct AggregateCompanionEntries {
+  std::unordered_map<std::string, AggregateFunctionEntry> aggregates;
+  std::unordered_map<std::string, VectorFunctionEntry> vectors;
+};
+
 class CompanionFunctionsRegistrar {
  public:
+  /// Construct the native companion family without publishing registries.
+  /// Factories resolve the original aggregate when invoked after publication.
+  /// Allows callers to validate names and publish a module transactionally.
+  static AggregateCompanionEntries prepareEntries(
+      const std::string& name,
+      const std::vector<AggregateFunctionSignaturePtr>& signatures,
+      const AggregateFunctionMetadata& metadata);
+
   /// Register the partial companion function for an aggregate function of
   /// `name` and `signatures`. When there is already a function of the same
   /// name, if `overwrite` is true, the registration is replaced. Otherwise,

@@ -119,11 +119,16 @@ resolveVectorFunctionWithMetadata(
       functionName,
       [&](const auto& /*name*/, const auto& entry)
           -> std::optional<std::pair<TypePtr, VectorFunctionMetadata>> {
-        for (const auto& signature : entry.signatures) {
+        for (size_t signatureIndex = 0;
+             signatureIndex < entry.signatures.size();
+             ++signatureIndex) {
+          const auto& signature = entry.signatures[signatureIndex];
           exec::SignatureBinder binder(
               *signature, argTypes, TypeCoercer::defaults());
           if (binder.tryBind()) {
-            return {{binder.tryResolveReturnType(), entry.metadata}};
+            return {
+                {binder.tryResolveReturnType(),
+                 entry.metadataAt(signatureIndex)}};
           }
         }
         return std::nullopt;
@@ -143,7 +148,11 @@ resolveVectorFunctionWithMetadataWithCoercions(
       [&](const auto& /*name*/, const auto& entry)
           -> std::optional<std::pair<TypePtr, VectorFunctionMetadata>> {
         std::vector<std::pair<std::vector<Coercion>, TypePtr>> candidates;
-        for (const auto& signature : entry.signatures) {
+        std::vector<size_t> candidateSignatures;
+        for (size_t signatureIndex = 0;
+             signatureIndex < entry.signatures.size();
+             ++signatureIndex) {
+          const auto& signature = entry.signatures[signatureIndex];
           exec::SignatureBinder binder(*signature, argTypes, coercer);
           std::vector<Coercion> requiredCoercions;
           if (binder.tryBindWithCoercions(requiredCoercions)) {
@@ -151,19 +160,21 @@ resolveVectorFunctionWithMetadataWithCoercions(
             VELOX_CHECK_NOT_NULL(type);
             if (!hasCoercion(requiredCoercions)) {
               coercions.resize(argTypes.size(), nullptr);
-              return {{type, entry.metadata}};
+              return {{type, entry.metadataAt(signatureIndex)}};
             }
 
             candidates.emplace_back(requiredCoercions, type);
+            candidateSignatures.push_back(signatureIndex);
           }
         }
 
-        // All signatures share one metadata, so null behavior is uniform.
         auto index = Coercion::pickLowestCost(
             candidates, argTypes, [&](size_t candidateIndex) {
               return Coercion::CandidateMetadata{
                   .returnType = candidates[candidateIndex].second,
-                  .nullOnNull = entry.metadata.defaultNullBehavior};
+                  .nullOnNull =
+                      entry.metadataAt(candidateSignatures[candidateIndex])
+                          .defaultNullBehavior};
             });
 
         if (index) {
@@ -173,7 +184,9 @@ resolveVectorFunctionWithMetadataWithCoercions(
             coercions.push_back(coercion.type);
           }
 
-          return {{candidates[index.value()].second, entry.metadata}};
+          return {
+              {candidates[index.value()].second,
+               entry.metadataAt(candidateSignatures[index.value()])}};
         }
 
         return std::nullopt;
@@ -211,7 +224,10 @@ getVectorFunctionWithMetadata(
           -> std::optional<std::pair<
               std::shared_ptr<VectorFunction>,
               VectorFunctionMetadata>> {
-        for (const auto& signature : entry.signatures) {
+        for (size_t signatureIndex = 0;
+             signatureIndex < entry.signatures.size();
+             ++signatureIndex) {
+          const auto& signature = entry.signatures[signatureIndex];
           exec::SignatureBinder binder(
               *signature, inputTypes, TypeCoercer::defaults());
           if (binder.tryBind()) {
@@ -219,7 +235,7 @@ getVectorFunctionWithMetadata(
 
             return {
                 {entry.factory(sanitizedName, inputArgs, config),
-                 entry.metadata}};
+                 entry.metadataAt(signatureIndex)}};
           }
         }
         return std::nullopt;
@@ -234,14 +250,34 @@ bool registerStatefulVectorFunction(
     std::vector<FunctionSignaturePtr> signatures,
     VectorFunctionFactory factory,
     VectorFunctionMetadata metadata,
-    bool overwrite) {
+    bool overwrite,
+    std::vector<VectorFunctionMetadata> signatureMetadata) {
+  VELOX_CHECK(
+      signatureMetadata.empty() ||
+          signatureMetadata.size() == signatures.size(),
+      "Signature metadata count must match signatures");
+  if (!signatureMetadata.empty()) {
+    metadata = signatureMetadata.front();
+    for (const auto& properties : signatureMetadata) {
+      metadata.deterministic &= properties.deterministic;
+      metadata.defaultNullBehavior &= properties.defaultNullBehavior;
+      metadata.supportsFlattening &= properties.supportsFlattening;
+      metadata.companionFunction &= properties.companionFunction;
+      if (metadata.owner != properties.owner) {
+        metadata.owner = "";
+      }
+    }
+  }
   auto sanitizedName = sanitizeName(name);
 
   if (overwrite) {
     vectorFunctionFactories().withWLock([&](auto& functionMap) {
       // Insert/overwrite.
       functionMap[sanitizedName] = {
-          std::move(signatures), std::move(factory), std::move(metadata)};
+          std::move(signatures),
+          std::move(factory),
+          std::move(metadata),
+          std::move(signatureMetadata)};
     });
     return true;
   }
@@ -249,7 +285,10 @@ bool registerStatefulVectorFunction(
   return vectorFunctionFactories().withWLock([&](auto& functionMap) {
     auto [iterator, inserted] = functionMap.insert(
         {sanitizedName,
-         {std::move(signatures), std::move(factory), std::move(metadata)}});
+         {std::move(signatures),
+          std::move(factory),
+          std::move(metadata),
+          std::move(signatureMetadata)}});
     return inserted;
   });
 }

@@ -67,14 +67,9 @@ std::vector<AggregateInfo> toAggregateInfo(
               dynamic_cast<const core::ConstantTypedExpr*>(arg.get())) {
         channels.push_back(kConstantChannel);
         constants.push_back(constant->toConstantVector(operatorCtx.pool()));
-      } else if (
-          auto lambda = dynamic_cast<const core::LambdaTypedExpr*>(arg.get())) {
-        for (const auto& name : lambda->signature()->names()) {
-          if (auto captureIndex = inputType->getChildIdxIfExists(name)) {
-            channels.push_back(captureIndex.value());
-            constants.push_back(nullptr);
-          }
-        }
+      } else if (dynamic_cast<const core::LambdaTypedExpr*>(arg.get())) {
+        // The signature contains formal parameters, which shadow input fields
+        // of the same name. Pass the lambda separately below, not as columns.
       } else {
         VELOX_FAIL(
             "Expression must be field access, constant, or lambda: {}",

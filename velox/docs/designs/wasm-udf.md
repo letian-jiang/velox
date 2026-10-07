@@ -1,949 +1,473 @@
-# WebAssembly UDF and UDAF Integration Proposal
+# WebAssembly scalar UDF and aggregate integration
 
-*2026-08-06*
+Status: experimental implementation, updated 2026-10-05. This document defines
+the current host contract; the [RFC](wasm-udf-rfc.md) explains the proposal and
+[capability comparison](wasm-scalar-sfi-parity.md) describes native SFI differences.
+The [community review](wasm-udf-community-review.md) retains the original findings
+and their remediation status. This is not a production security certification.
 
-## Status
+## Authoring and execution
 
-This document records the earlier manifest-based design. The current
-self-contained module design and its in-process untrusted-code rationale are
-described in [the Wasm UDF RFC](wasm-udf-rfc.md).
+Rust scalar authors write ordinary row functions annotated with `velox_scalar`.
+Arguments are scalars, borrowed byte/string views, `ArrayView`, `MapView`,
+`RowView`, `Generic`, `VariadicView` (or owned `Variadic<T>`) and their
+nullable/null-free forms. Scalar
+user functions do not receive a RecordBatch. The generated adapter reads one
+Arrow IPC batch, invokes the function for selected compact rows, and constructs
+one result batch. Aggregate and legacy batch APIs have separate contracts.
 
-It describes the original proposal for loading WebAssembly scalar UDFs and
-aggregate UDFs (UDAFs) into Velox, including the initial ABI, external manifest,
-Arrow IPC protocol, execution lifecycle, and Rust SDK responsibilities. Some
-packaging and implementation-status statements below are now outdated.
+A module embeds declarations as NUL-terminated JSON objects in `velox.udf.v1`.
+No sidecar JSON is loaded. The host reads a bounded immutable byte snapshot,
+parses its declarations and compiles exactly those bytes. The module cache
+compares complete contents, independently of pathname, size or timestamp;
+expired weak entries are removed and compilation occurs outside its mutex.
+Compiled code can be shared, while each expression/aggregate owns its Store.
 
-## Motivation
+Standard scalar transport supports BOOLEAN, signed integers through HUGEINT,
+floats, arbitrary-byte VARCHAR, VARBINARY, DATE, full-range TIMESTAMP,
+DECIMAL, UNKNOWN and nested ARRAY/MAP/ROW. SQL type/integer variables and a
+final variadic argument are bound by native SignatureBinder. The borrowed
+variadic reader checks tail schemas once per batch, then converts only accessed
+arguments without allocating a row Vec. NULL metadata can be checked without
+value conversion. Nullable iteration preserves decoding
+errors, including errors after a skipped NULL. The owned Variadic adapter remains
+available and reads every tail argument before entering user code. Typed Rust ROW
+views support tuples through arity 16; dynamic views handle larger rows.
+Other logical types require explicit codecs. Custom and OPAQUE values use
+codec ID/version/type identity or validated invocation-scoped object handles.
+They do not expose a native pointer or arbitrary C++ object methods.
 
-Velox functions are normally compiled into the host binary. This proposal adds
-support for loading functions from `.wasm` files during process startup and
-registering them in the existing scalar or aggregate function registry.
+## Startup registration
 
-The intended user experience is:
-
-1. Implement a row-oriented scalar function or aggregate in Rust.
-2. Use the Rust SDK macros to generate Arrow IPC batch entry points.
-3. Compile the crate to a `.wasm` module.
-4. Write a manifest that describes the Velox signature, the `.wasm` path, and
-   the exported entry points.
-5. Configure the host application to load the manifest before query execution.
-
-The WebAssembly boundary is batch-oriented even though the user-facing Rust
-API is row-oriented. User arguments, intermediate values, and results cross
-the boundary as Arrow IPC record batches. Aggregate creation is a specialized
-control call that takes a scalar group count and returns a raw handle array.
-
-## Goals
-
-- Load UDF modules once during process startup. Hot reload is not required.
-- Support scalar UDFs through Velox `VectorFunction` registration.
-- Support UDAFs through Velox `Aggregate` registration.
-- Make one WebAssembly call per Velox batch, rather than one call per row.
-- Let Rust users implement row-oriented functions while SDK macros generate
-  the batch-oriented adapter.
-- Keep active UDAF states inside WebAssembly linear memory.
-- Support partial/final aggregation and spilling through serializable
-  intermediate states.
-- Preserve Velox selectivity, null, conditional-result, and aggregate lifecycle
-  semantics.
-- Use a small, versioned ABI that can be validated when a manifest is loaded.
-
-## Non-goals
-
-- Updating or replacing a loaded module without restarting the process.
-- Passing Velox vectors directly into WebAssembly linear memory.
-- A zero-copy host-to-guest data path.
-- WASI filesystem, network, clock, or process access.
-- Accounting WebAssembly state memory in Velox memory arbitration in the first
-  version.
-- Complex Velox types, generic signatures, and variadic signatures in the first
-  version.
-
-## Architecture
-
-The integration consists of five layers:
-
-1. **Manifest loader**: reads a user-written manifest and validates the declared
-   function and ABI.
-2. **WebAssembly runtime**: owns the Wasmtime engine, compiled-module cache,
-   stores, instances, exported functions, and linear-memory access.
-3. **Arrow IPC bridge**: converts between selected Velox rows and Arrow IPC
-   buffers.
-4. **Velox adapters**: implement `VectorFunction` and `Aggregate` and register
-   them in the existing registries.
-5. **Rust SDK**: decodes Arrow IPC, invokes row-oriented user code, maintains
-   aggregate state, and encodes Arrow IPC results.
-
-```text
-manifest
-   |
-   v
-WasmUdfLoader -----> shared Wasmtime Engine
-   |                         |
-   |                         +---- compiled module cache
-   |
-   +---- scalar registry ----> WasmVectorFunction ----> Store + Instance
-   |
-   +---- aggregate registry --> WasmAggregate --------> Store + Instance
-
-Velox selected rows
-   -> compact RowVector
-   -> Arrow IPC
-   -> guest linear memory
-   -> Rust batch adapter
-   -> row-oriented function
-   -> Arrow IPC result
-   -> scatter into Velox result
+```cpp
+using namespace facebook::velox::functions::wasm;
+WasmOptions policy;
+policy.memoryLimitBytes = 64UL << 20;
+policy.tableElements = 10'000;
+policy.tables = 1;
+policy.fuelPerCall = 100'000'000;
+policy.maxCallMillis = 1'000;
+registerWasmModule("/path/to/functions.wasm", false, policy);
 ```
 
-The process owns one Wasmtime engine. Compiled modules are cached by canonical
-Wasm path and file identity. Each scalar expression or aggregate adapter owns a
-separate Store and Instance. Compiled code is shared, but mutable guest memory
-and state are not shared between adapters.
-
-The initial target is `wasm32-unknown-unknown`. Modules must not import WASI or
-other host capabilities.
-
-## Packaging and Manifest
-
-The manifest is written by the user. The Rust SDK does not generate it. A
-manifest describes one Velox function and is the unit passed to the loader.
-Multiple manifests may reference different exports from the same `.wasm` file;
-the compiled module can still be shared by the runtime cache.
-
-Paths in the manifest are resolved relative to the manifest file. The loader
-must canonicalize paths before using them as cache keys.
-
-### Scalar manifest
-
-```json
-{
-  "abi_version": 1,
-  "name": "my_add",
-  "kind": "scalar",
-  "wasm": "./my_udfs.wasm",
-  "entrypoint": "my_add_batch",
-  "arguments": [
-    {"type": "bigint", "nullable": false},
-    {"type": "bigint", "nullable": false}
-  ],
-  "return": {"type": "bigint", "nullable": false},
-  "deterministic": true,
-  "default_null_behavior": true
-}
-```
-
-### Aggregate manifest
-
-```json
-{
-  "abi_version": 1,
-  "name": "my_avg",
-  "kind": "aggregate",
-  "wasm": "./my_udafs.wasm",
-  "entrypoints": {
-    "create": "my_avg_create_batch",
-    "destroy": "my_avg_destroy_batch",
-    "update": "my_avg_update_batch",
-    "update_single_group": "my_avg_update_single_group_batch",
-    "serialize": "my_avg_serialize_batch",
-    "merge": "my_avg_merge_batch",
-    "merge_single_group": "my_avg_merge_single_group_batch",
-    "finalize": "my_avg_finalize_batch"
-  },
-  "arguments": [
-    {"type": "double", "nullable": true}
-  ],
-  "intermediate": {"type": "varbinary", "nullable": true},
-  "return": {"type": "double", "nullable": true},
-  "order_sensitive": false,
-  "ignore_duplicates": false,
-  "default_null_behavior": false
-}
-```
-
-There is no numeric function ID. The manifest path identifies the deployment
-unit, and the manifest maps the Velox function directly to named exports in the
-Wasm module.
-
-At load time, the host validates:
-
-- the ABI version;
-- required manifest fields;
-- Velox type names and nullability declarations;
-- scalar versus aggregate metadata;
-- the presence and Wasm signatures of all declared exports;
-- function-name collisions in the Velox registry; and
-- that the module imports no disallowed capabilities.
-
-The manifest is authoritative for the SQL signature. A mismatch between the
-manifest and the Rust implementation is a configuration error. The host detects
-all structural mismatches it can at startup and validates IPC schemas on every
-call.
-
-## Core WebAssembly ABI
-
-### Value types
-
-WebAssembly does not have an `i128` integer value type. It has the SIMD `v128`
-value type, which Wasmtime can return directly. The ABI uses `v128` as four
-little-endian `u32` lanes:
-
-```text
-lane 0: status
-lane 1: data pointer
-lane 2: data length
-lane 3: reserved
-```
-
-Conceptually, this is:
-
-```c
-struct AbiResult {
-  uint32_t status;
-  uint32_t dataPtr;
-  uint32_t dataLen;
-  uint32_t reserved;
-};
-```
-
-The Rust SDK must explicitly return `core::arch::wasm32::v128`. It must not
-return a Rust `u128` or C-compatible struct and assume that the compiler will
-lower it to a Wasm `v128` result. Building the SDK requires the `simd128` target
-feature.
-
-### Common memory exports
-
-Every module exports guest allocation helpers with the following Wasm
-signatures:
-
-```text
-velox_wasm_alloc: (i32 length) -> i32 pointer
-velox_wasm_free:  (i32 pointer, i32 length) -> ()
-```
-
-Input and output byte buffers are immutable while owned by the other side.
-An entry point must not return an output buffer that aliases its input buffer.
-
-### Function entry points
-
-Scalar entry points and the aggregate `destroy`, `update`, `serialize`,
-`merge`, and `finalize` entry points use this Wasm signature:
-
-```text
-(i32 inputPointer, i32 inputLength) -> v128 AbiResult
-```
-
-Aggregate creation is a control operation with a specialized signature:
-
-```text
-(i32 groupCount) -> v128 AbiResult
-```
-
-It returns a raw little-endian `UInt32[groupCount]` state-handle array rather
-than Arrow IPC. An operation with no result returns a successful result with
-`(dataPtr, dataLen) == (0, 0)`.
-
-Aggregate single-group update and merge entry points avoid a repeated handle
-column and use this signature:
-
-```text
-(i32 stateHandle, i32 inputPointer, i32 inputLength) -> v128 AbiResult
-```
-
-### Status and errors
-
-`status == 0` indicates success. If `status != 0`, `dataPtr` and `dataLen`
-identify a UTF-8 error message in guest memory. A non-zero status is a batch
-protocol, aggregate-business, or runtime error. Scalar row-business errors are
-transported separately in the successful Arrow result so Velox can associate
-them with individual input rows.
-
-Wasm traps, invalid memory ranges, malformed IPC, schema mismatches, and
-resource-limit violations are query errors. A UDAF update is not transactional:
-if it mutates some states and then returns an error, the query fails and the
-partially updated states are discarded with the query.
-
-### Ownership and call sequence
-
-For an Arrow IPC call, the host:
-
-1. Serializes the input batch into a host-owned Arrow IPC buffer.
-2. Calls `velox_wasm_alloc`.
-3. Validates the returned input range and copies the bytes into linear memory.
-4. Calls the manifest-selected entry point.
-5. Unpacks the `v128` result and validates the output range.
-6. Decodes and consumes the result while the guest memory is valid.
-7. Frees the output buffer, if present.
-8. Frees the input buffer, including on error paths.
-
-Host code must use guards so that input and output buffers are released when
-decoding or scattering throws.
-
-For aggregate `create`, the host passes the group count directly, validates
-and copies the raw returned handle array, and frees that output buffer. There
-is no input allocation or Arrow IPC encoding for this operation.
-
-## Arrow IPC Contract
-
-Version 1 uses the Arrow IPC streaming format with exactly one schema and one
-record batch per non-empty payload. The first version disables IPC compression
-and dictionary encoding. Repeating the schema has some overhead, but makes each
-call self-describing and independently validatable.
-
-Reserved runtime fields use the `__velox_wasm_` prefix. User argument names
-must not use this prefix.
-
-All arrays in a record batch have the same row count. The host and SDK validate
-the row count and complete schema before consuming a batch.
-
-The first version supports:
-
-- boolean;
-- signed 8-, 16-, 32-, and 64-bit integers;
-- 32- and 64-bit floating point;
-- UTF-8 strings;
-- binary strings;
-- dates; and
-- timestamps.
-
-Array, map, row, decimal, generic, and variadic types are deferred.
-
-## Scalar Functions
-
-### Input construction
-
-`VectorFunction::apply` receives a `SelectivityVector` whose selected rows may
-be non-contiguous. The host compacts only selected rows into an Arrow batch:
-
-1. Collect the selected row indices in their original order.
-2. Dictionary-wrap or gather every argument using those indices.
-3. Build a compact `RowVector` with `N` rows.
-4. Export the RowVector through the Velox Arrow bridge.
-5. Serialize the resulting Arrow RecordBatch into Arrow IPC.
-
-If all rows are selected and the arguments are already suitable for Arrow
-export, the adapter may avoid the index vector and dictionary wrapping.
-
-The active row indices remain on the host. They are not included in the IPC
-batch.
-
-### Guest execution
-
-The generated Rust batch entry point:
-
-1. decodes the Arrow IPC batch;
-2. validates the declared argument types;
-3. extracts one row at a time;
-4. invokes the user's row-oriented Rust function; and
-5. builds and serializes the output batch.
-
-The WebAssembly boundary is crossed once per batch. The row loop runs entirely
-inside the guest.
-
-### Output and scatter
-
-The output batch has exactly `N` rows. The host decodes it and scatters row `i`
-to the original selected row index `selectedRows[i]`. It must preserve existing
-result values at unselected positions, which is required for conditional Velox
-expressions.
-
-The host may decode directly from a non-owning view of linear memory if it:
-
-- holds the Instance lock for the entire decode and scatter operation;
-- performs no guest call that could grow or reuse memory;
-- copies all output values into host-owned Velox buffers; and
-- destroys all Arrow and temporary Velox views before freeing guest memory.
-
-The initial implementation may instead copy the output IPC bytes to a
-host-owned buffer before decoding. This is less subtle and should be the
-default until the view-based path is proven correct.
-
-### Null behavior
-
-The scalar manifest declares `default_null_behavior`.
-
-- When true, the host excludes rows with a null argument before constructing
-  the IPC batch. The guest row function receives only non-null values.
-- When false, validity information is preserved and the Rust function receives
-  nullable values, typically as `Option<T>`.
-
-The SDK supports nullable output values. A scalar row function may return
-`Result<T, E>` where `E: ToString`. The generated result batch then contains a
-nullable hidden `__velox_wasm_error: Utf8` column. An error row has a null value
-and its error message in this column. The host maps compact rows back to the
-original selected rows and records the errors in `EvalCtx`, which preserves
-Velox `TRY` semantics. IPC decoding, schema, and other batch-level failures
-still fail the whole invocation.
-
-## Aggregate Functions
-
-### Business row-oriented interface
-
-The business UDAF implements exactly six row-oriented lifecycle methods. It
-does not implement WebAssembly exports or Arrow IPC handling directly:
-
-```rust
-pub trait VeloxAggregate {
-    type State;
-    type Input<'a>
-    where
-        Self: 'a;
-    type Output;
-    type Error: std::fmt::Display;
-
-    fn create() -> Result<Self::State, Self::Error>;
-    fn destroy(state: Self::State);
-    fn update(
-        state: &mut Self::State,
-        input: Self::Input<'_>,
-    ) -> Result<(), Self::Error>;
-    fn serialize(
-        state: &Self::State,
-    ) -> Result<Vec<u8>, Self::Error>;
-    fn merge(
-        state: &mut Self::State,
-        intermediate: &[u8],
-    ) -> Result<(), Self::Error>;
-    fn finalize(
-        state: &Self::State,
-    ) -> Result<Self::Output, Self::Error>;
-}
-```
-
-`update` is called once for each raw input row. `merge` is called once for
-each non-null intermediate row and receives the business payload bytes; the
-business implementation performs payload deserialization and state merging
-inside `merge`. There is no separate business `deserialize` method.
-
-`serialize` returns the complete intermediate byte sequence, and `merge`
-receives exactly the same bytes. The SDK does not add a header, footer, magic,
-or version field. `finalize` and `serialize` must not mutate state because Velox
-may invoke extraction repeatedly. `destroy` consumes a state and is called at
-most once for every successfully created state.
-
-### State ownership
-
-Active aggregate states live entirely inside the guest. The host stores only a
-32-bit handle in each Velox group accumulator:
-
-```text
-Velox group accumulator                  WebAssembly instance
-+----------------------+                 +------------------------+
-| state handle: UInt32 | --------------> | handle -> Rust State   |
-+----------------------+                 +------------------------+
-```
-
-Handle `0` is reserved as invalid. Guest-generated handles start at `1`. This
-sentinel is a defensive check independent of Velox's group-row null and
-initialized metadata: an uninitialized or cleared accumulator cannot
-accidentally name a guest state. A handle is local to one Wasm Instance and
-must never be passed to another Instance.
-
-A handle is an opaque registry key, not a linear-memory address. The host never
-dereferences it, and guest allocator activity or linear-memory growth cannot
-change which state it identifies.
-
-The host adapter reports:
-
-```text
-accumulatorFixedWidthSize() = sizeof(uint32_t)
-accumulatorUsesExternalMemory() = true
-isFixedSize() = true
-```
-
-Marking the accumulator as using external memory ensures that Velox invokes
-the aggregate's destroy lifecycle for group state held by the guest.
-`accumulatorUsesExternalMemory()` is a lifecycle signal; it does not make
-Velox account for guest memory. `isFixedSize()` describes the host-visible
-four-byte handle, not the guest State footprint.
-
-The adapter does not override `accumulatorAlignmentSize()`, so the default
-alignment is one byte. It must access the handle with unaligned-safe loads and
-stores such as `folly::loadUnaligned<uint32_t>` and
-`folly::storeUnaligned<uint32_t>`. It must never cast the accumulator address
-to `uint32_t*` or use an accessor that assumes natural alignment.
-
-### Guest state registry
-
-Each generated UDAF owns a registry inside each Wasm Instance. The registry is
-concrete state, not host metadata:
-
-```rust
-struct StateRegistry<S> {
-    next_handle: Option<u32>,
-    states: HashMap<u32, S>,
-}
-```
-
-`next_handle` starts as `Some(1)`. Creating a state assigns the current value,
-increments it with checked arithmetic, and inserts
-`VeloxAggregate::create()` into `states`. Assigning `u32::MAX` changes
-`next_handle` to `None`; a subsequent create fails the query with handle-space
-exhaustion.
-
-Handles are not reused during an Instance lifetime. This avoids an ABA problem
-where a stale host handle could accidentally refer to a newly created state.
-Removing a state releases the Rust state and its owned allocations for reuse by
-the guest allocator. The number of live map entries follows the number of
-active states, although hash-table capacity and WebAssembly linear-memory pages
-may remain at their high-water marks after states are removed.
-
-The generated Rust code uses a module-local, lazily initialized registry with
-safe interior mutability, for example a `thread_local!` `RefCell` specialized
-for the aggregate's concrete state type. Version 1 enables neither Wasm threads
-nor reentrant host imports, and the host serializes calls to the Instance. A
-future threaded or reentrant ABI must replace this storage strategy.
-
-Registry operations are:
-
-| Guest operation | Registry behavior |
-|-----------------|-------------------|
-| `create` | Allocate handles and insert newly created states. |
-| `update` | Look up each handle mutably and call the row-oriented update method in input order. |
-| `merge` | Look up the destination mutably and pass the opaque intermediate bytes to `merge`. |
-| `finalize` | Look up each state immutably and call `finalize(&State)`. |
-| `serialize` | Look up each state immutably and return the bytes from `serialize(&State)` unchanged. |
-| `destroy` | Remove each state and pass ownership to the business `destroy` method. |
-
-`update`, `merge`, `finalize`, and `serialize` reject handle `0` and unknown
-handles. `destroy` is idempotent: handle `0` and already absent handles are
-ignored so that error cleanup does not hide the original failure. Normal host
-cleanup destroys all live handles through the business method. Dropping the
-Wasmtime Store and Instance reclaims the entire linear memory even if a trap
-prevents normal destruction, but code must not depend on Rust `Drop` side
-effects during this abnormal teardown.
-
-### Hidden state-handle column
-
-For grouped aggregation, the state handle is a hidden `UInt32` Arrow column in
-the same record batch as the user arguments:
-
-```text
-__velox_wasm_state_handle  arg0  arg1
--------------------------  ----  ----
-12                         ...   ...
-19                         ...   ...
-12                         ...   ...
-```
-
-Rows zero and two update the same guest state. Handles are aligned one-to-one
-with the compacted argument rows. A single `(inputPointer, inputLength)` pair is
-therefore sufficient for both handles and arguments.
-
-The SDK consumes the hidden column and does not expose it in the user's
-row-oriented aggregate API.
-
-The control column is constructed directly as an Arrow `UInt32` array. It does
-not need a corresponding user-visible unsigned Velox SQL type because it is
-created and consumed entirely inside the Wasm adapter.
-
-The host first exports the compacted arguments as an in-memory Arrow
-`RecordBatch`, inserts the handle array into that batch, and encodes the final
-batch to IPC exactly once. It must not encode the arguments to IPC, decode them
-again to add the handle column, and then encode a second time.
-
-For single-group aggregation, the handle is passed as the first scalar Wasm
-argument. Its Arrow batch contains only user arguments for raw input, or only
-the Binary intermediate column for merge.
-
-### Generated WebAssembly exports
-
-The aggregate macro generates eight manifest-named exports. The host calls only
-these batch exports; the adapter inside the guest invokes the business methods:
-
-| Export | Wasm signature | Input | Output | Business call |
-|--------|----------------|-------|--------|---------------|
-| `create_batch` | `(i32 groupCount) -> v128` | scalar group count | raw little-endian `UInt32[]` handles | `create()` once per group |
-| `destroy_batch` | `(i32 ptr, i32 len) -> v128` | Arrow handles | none | `destroy(State)` |
-| `update_batch` | `(i32 ptr, i32 len) -> v128` | Arrow handles and arguments | none | `update(&mut State, Input)` once per row |
-| `update_single_group_batch` | `(i32 handle, i32 ptr, i32 len) -> v128` | Arrow arguments | none | `update(&mut State, Input)` once per row for one state |
-| `serialize_batch` | `(i32 ptr, i32 len) -> v128` | Arrow handles | Arrow Binary | `serialize(&State)` |
-| `merge_batch` | `(i32 ptr, i32 len) -> v128` | Arrow handles and Binary | none | `merge(&mut State, payload)` once per non-null row |
-| `merge_single_group_batch` | `(i32 handle, i32 ptr, i32 len) -> v128` | Arrow Binary | none | `merge(&mut State, payload)` once per non-null row for one state |
-| `finalize_batch` | `(i32 ptr, i32 len) -> v128` | Arrow handles | one result column | `finalize(&State)` |
-
-Except for `create_batch`, the aggregate entry points use these Arrow IPC
-schemas:
-
-| Operation | Input batch | Output batch |
-|-----------|-------------|--------------|
-| `update` | `__velox_wasm_state_handle: UInt32`, user arguments | none |
-| `update_single_group` | user arguments | none |
-| `merge` | `__velox_wasm_state_handle: UInt32`, `__velox_wasm_intermediate: Binary` | none |
-| `merge_single_group` | `__velox_wasm_intermediate: Binary` | none |
-| `finalize` | `__velox_wasm_state_handle: UInt32` | one user result column |
-| `serialize` | `__velox_wasm_state_handle: UInt32` | `__velox_wasm_intermediate: Binary` |
-| `destroy` | `__velox_wasm_state_handle: UInt32` | none |
-
-`none` means that the operation returns a successful `AbiResult` with a null
-pointer and zero length; it does not encode an empty Arrow IPC stream.
-
-`create_batch` takes only the number of new groups. It calls the business
-`create` method that many times and returns one handle per group in request
-order. For example, handles `[12, 13, 14]` correspond positionally to the
-host's new-group list `[groupA, groupB, groupC]`; no group ordinal crosses the
-boundary. The output byte length must equal `groupCount * sizeof(uint32_t)`.
-The SDK writes handles into a byte allocation using little-endian encoding so
-the common byte-buffer deallocator can free it safely.
-
-Creation is batch-atomic. If the business `create` method fails after some
-states have been inserted, the SDK removes those new states, invokes the
-business `destroy` method for each one, and returns an error without exposing a
-partial handle array.
-
-`update` preserves the order of selected input rows. The Rust SDK processes the
-batch in row order, which is required for order-sensitive aggregates. The same
-handle may occur many times.
-
-`destroy` removes states from the guest registry and passes ownership to the
-business `destroy` method. Destroying handle `0` or an already absent handle is
-a no-op to make cleanup paths idempotent. Other operations reject invalid or
-unknown handles.
-
-### Velox lifecycle mapping
-
-The adapter maps Velox aggregate methods as follows:
-
-| Velox method | Guest operation |
-|--------------|-----------------|
-| `initializeNewGroups` | `create` |
-| `addRawInput` | `update` |
-| `addSingleGroupRawInput` | `update_single_group` with a scalar handle |
-| `addIntermediateResults` | `merge` |
-| `addSingleGroupIntermediateResults` | `merge_single_group` with a scalar handle |
-| `extractValues` | `finalize` |
-| `extractAccumulators` | `serialize` |
-| `destroy` | `destroy` |
-
-The adapter does not initially implement the optional `toIntermediate` fast
-path.
-
-### Host call sequences
-
-For `initializeNewGroups`, the host keeps the new group pointers in a stable
-ordered list, calls `create_batch(newGroupCount)`, validates that the returned
-buffer contains exactly that many non-zero, distinct handles, and writes
-handle `i` into accumulator `i`. It then frees the guest output buffer. A zero
-group count is handled locally without a guest call. The host rejects a count
-larger than `INT32_MAX` and never passes a negative `i32` value.
-
-For `addRawInput`, the host compacts the selected rows, reads the destination
-handle for each row from its group accumulator, builds an Arrow batch with the
-hidden handle column followed by the user arguments, copies it into guest
-memory, and calls `update_batch`. `addSingleGroupRawInput` builds an arguments-
-only batch and calls `update_single_group_batch` with the destination handle as
-a scalar ABI argument.
-
-For `extractAccumulators`, the host builds an Arrow handle batch, calls
-`serialize_batch`, validates a one-column Binary result with the expected row
-count, and writes those opaque values into the Velox `VARBINARY` intermediate
-result vector. The host never examines the business payload.
-
-For `addIntermediateResults`, the host builds an Arrow batch containing the
-destination handles and upstream Binary intermediate values, then calls
-`merge_batch`. The guest SDK passes each non-null Binary value unchanged to the
-row-oriented `merge` method.
-`addSingleGroupIntermediateResults` builds an intermediate-only batch and calls
-`merge_single_group_batch` with one scalar destination handle.
-
-For `extractValues`, the host sends one handle per output group to
-`finalize_batch`, validates the manifest-declared result schema and row count,
-and scatters the returned column into the Velox result vector.
-
-For aggregate destruction, the host sends all still-live handles to
-`destroy_batch`, clears the accumulator handle slots, and finally drops the
-Wasmtime Store and Instance. The guest removes each known state before calling
-the business `destroy` method, so repeated host cleanup cannot call business
-destruction twice.
-
-### Intermediate state
-
-Velox registers the UDAF intermediate type as `VARBINARY`. During partial
-aggregation or spilling, `serialize` produces one opaque byte string per
-state. During intermediate or final aggregation, `merge` receives these byte
-strings and combines them into states owned by the current guest Instance.
-
-The host never interprets intermediate bytes. The business `serialize` method
-defines the payload encoding, and the business `merge` method deserializes that
-payload and combines it with the destination state. The SDK transports the
-byte sequence unchanged and there is no separate business or Wasm
-`deserialize` entry point.
-
-The SDK adds no header, footer, magic, version, checksum, or payload length.
-The Arrow Binary array already carries each value's length. If the business
-format needs identification, compatibility checks, or corruption detection,
-the business implementation includes those fields in the bytes returned by
-`serialize` and validates them inside `merge`.
-
-Distributed execution requires all stages to deploy business implementations
-with compatible intermediate formats. Compatibility is a deployment contract;
-the version 1 SDK does not enforce it with a generic wire envelope.
-
-`finalize` and `serialize` must not mutate aggregate state. Velox may call
-extraction repeatedly, and spilling may call accumulator extraction
-concurrently with other activity.
-
-### Null behavior
-
-The aggregate manifest declares `default_null_behavior`.
-
-- When true, rows with a null user argument are excluded before IPC encoding.
-- When false, argument validity is preserved and nullable Rust values are
-  passed to the row-oriented update function.
-
-The aggregate result may be null according to the manifest output type. A live
-state's business `serialize` method returns a non-null payload. A null incoming
-intermediate value represents no state contribution; `merge_batch` skips it
-without invoking the business `merge` method. The adapter maps guest Arrow
-validity bits to Velox nulls.
-
-### Concurrency
-
-A Wasmtime Store cannot be used concurrently. Each aggregate adapter therefore
-serializes access to its Store, Instance, memory, allocator exports, and state
-registry with a mutex. This is required in particular because Velox may call
-`extractAccumulators` concurrently during spilling.
-
-The same locking rule applies to a scalar adapter unless its execution context
-guarantees strict thread confinement.
-
-## Memory and Resource Limits
-
-The first version stores only the 32-bit state handle in the Velox accumulator.
-It does not report guest state sizes to Velox. Consequently:
-
-- Velox sees four bytes of accumulator data per group;
-- guest `HashMap`, `Vec`, `String`, and other allocations are absent from Velox
-  group-size and query-memory accounting;
-- guest state growth does not independently cause Velox to spill; and
-- memory pressure can reach the Wasmtime limit and fail the query instead of
-  triggering cooperative spilling.
-
-This is an explicit first-version limitation. `isFixedSize()` describes the
-host-visible accumulator as fixed size, not the actual guest state footprint.
-
-Every Store must have a hard linear-memory limit. The runtime also configures a
-maximum Wasm stack. Fuel or epoch interruption can be enabled to prevent
-unbounded computation and integrate with query cancellation.
-
-A future design may report per-state estimates or reserve total linear-memory
-growth in a Velox memory pool. That work is separate from the initial ABI and
-must not add a tracked-size field to the group accumulator until the accounting
-semantics are defined.
-
-## Rust SDK
-
-The SDK consists of a runtime crate and a proc-macro crate.
-
-A scalar user function is row-oriented:
-
-```rust
-#[velox_scalar(export = "my_add_batch")]
-fn my_add(left: i64, right: i64) -> i64 {
-    left + right
-}
-```
-
-The macro generates the `(i32, i32) -> v128` export, Arrow IPC decoding, row
-loop, output-array construction, IPC encoding, and ABI error conversion.
-
-An aggregate exposes row-oriented state transitions:
-
-```rust
-#[velox_aggregate(prefix = "my_avg")]
-impl VeloxAggregate for MyAverage {
-    type State = AverageState;
-    type Input<'a> = (Option<f64>,);
-    type Output = Option<f64>;
-    type Error = String;
-
-    fn create() -> Result<Self::State, Self::Error>;
-    fn destroy(state: Self::State);
-    fn update(
-        state: &mut Self::State,
-        input: Self::Input<'_>,
-    ) -> Result<(), Self::Error>;
-    fn serialize(
-        state: &Self::State,
-    ) -> Result<Vec<u8>, Self::Error>;
-    fn merge(
-        state: &mut Self::State,
-        intermediate: &[u8],
-    ) -> Result<(), Self::Error>;
-    fn finalize(
-        state: &Self::State,
-    ) -> Result<Self::Output, Self::Error>;
-}
-```
-
-The aggregate macro generates the eight manifest-named batch exports and a
-module-local `UInt32 -> State` registry. It does not generate or require a
-`deserialize` method: business payload decoding is part of the business
-`merge` implementation. `finalize` and `serialize` take immutable state
-references to enforce side-effect-free extraction.
-
-The SDK and handwritten manifest are intentionally separate. The SDK may offer
-a validation CLI in the future, but the `.wasm` file does not need to contain
-registration metadata.
-
-## Build Integration
-
-The host integration should be optional behind a CMake option such as:
-
-```text
-VELOX_ENABLE_WASM_UDF
-```
-
-Enabling it also enables Arrow support. Wasmtime and Arrow versions must be
-pinned by the build. Wasmtime is linked through its C or header-only C++ API;
-the integration must not expose Wasmtime types through public Velox APIs.
-
-The proposed source layout is:
-
-```text
-velox/functions/wasm/
-  Abi.*
-  Manifest.*
-  Runtime.*
-  ArrowIpc.*
-  WasmVectorFunction.*
-  WasmAggregate.*
-  Registration.*
-  tests/
-
-velox/functions/wasm/sdk/
-  velox-wasm-sdk/
-  velox-wasm-macros/
-  examples/
-```
-
-The application embedding Velox is responsible for calling the manifest loader
-before queries are planned or executed.
-
-## Validation and Failure Handling
-
-The host must validate all untrusted values crossing the boundary:
-
-- allocation results are in current linear memory;
-- `pointer + length` does not overflow and is in bounds;
-- output row count matches the expected compacted row count;
-- output fields match the manifest schema;
-- group accumulators are initialized before their state handles are read;
-- `create_batch` returns exactly `groupCount * sizeof(uint32_t)` bytes without
-  multiplication overflow;
-- state handles returned by `create_batch` are non-zero and distinct within
-  the returned batch;
-- state handles consumed by other operations are non-zero;
-- aggregate operation schemas contain the reserved fields in the required
-  order and types; and
-- IPC payloads contain exactly one record batch.
-
-Modules have no host imports in version 1. Wasmtime memory, stack, and execution
-limits remain mandatory even when modules are trusted, because accidental
-infinite loops and excessive allocation must not destabilize the host process.
-
-## Performance Considerations
-
-Arrow IPC necessarily introduces serialization and memory copies. The design
-optimizes the call count, not zero-copy transport:
-
-```text
-Velox vectors
-  -> Arrow IPC encode
-  -> copy into guest
-  -> guest IPC decode
-  -> row-oriented user loop
-  -> guest IPC encode
-  -> host IPC decode
-  -> Velox scatter
-```
-
-The adapter may split a Velox input into multiple Wasm calls when a configurable
-maximum row count or IPC byte size is exceeded. It must not split individual
-aggregate groups semantically; sequential chunks update the same handle in
-input order.
-
-Benchmarks should report at least:
-
-- gather and Velox-to-Arrow conversion time;
-- host IPC encoding time;
-- host-to-guest copy time;
-- guest IPC decoding time;
-- user function time;
-- guest IPC encoding time;
-- host IPC decoding time; and
-- scatter time.
-
-Possible later optimizations include schema caching, direct output-memory
-views, and dictionary encoding for the grouped state-handle column. These
-optimizations must preserve the version 1 semantics.
-
-## Testing Strategy
-
-Tests are required at four levels:
-
-1. **ABI tests** validate `v128` lane layout, allocation ownership, bounds
-   checking, traps, and error cleanup.
-2. **IPC tests** cover every supported type, nulls, empty batches, malformed
-   streams, and schema mismatches across C++ Arrow and Rust Arrow.
-3. **Scalar tests** cover sparse selectivity, conditional expressions,
-   constant and dictionary inputs, null behavior, chunking, and result scatter.
-4. **Aggregate tests** cover create counts and raw handle arrays, batch-create
-   rollback, repeated handles, multiple groups, global aggregation, nulls,
-   partial/final execution, spilling, repeated finalization and serialization,
-   business state destruction, and concurrent accumulator extraction.
-
-End-to-end tests build example Rust modules with the SDK and load them through
-handwritten manifests.
-
-## Implementation Phases
-
-1. Add the Wasmtime runtime wrapper, ABI types, manifest parser, and startup
-   validation.
-2. Implement Arrow IPC conversion and scalar functions for primitive types.
-3. Implement guest state handles, scalar-count `create_batch`, and the
-   aggregate create, update, finalize, and destroy lifecycle.
-4. Add business-defined intermediate serialization and merge, then validate
-   partial/final and spill execution.
-5. Add resource limits, cancellation, diagnostics, negative tests, and
-   benchmarks.
-6. Evaluate complex types and transport optimizations based on measurements.
-
-## Alternatives Considered
-
-### Function IDs and a shared dispatcher
-
-A single `call(functionId, operation, pointer, length)` export can support many
-functions, but duplicates information already present in the manifest. Named
-exports are easier to inspect and validate and let the manifest directly select
-the function. The design therefore has no function ID.
-
-### Generated manifest embedded in the Wasm module
-
-Embedding generated metadata would reduce handwritten configuration, but it
-couples deployment naming and SQL registration to the Rust build. A handwritten
-manifest is more explicit and allows multiple Velox registrations to reference
-one module. The SDK therefore generates code only, not registration metadata.
-
-### Separate handle and argument buffers
-
-An aggregate update could accept a raw handle array and a second Arrow IPC
-buffer. This requires two independent allocations and lengths and introduces a
-new alignment invariant. A hidden `UInt32` column keeps handles and arguments
-in one self-describing batch, so one pointer-length pair is sufficient.
-
-### Host-owned aggregate state
-
-Moving serialized state back to the host after every update would make memory
-accounting easier, but adds serialization and copies to every batch and violates
-the requirement that active state remain in the guest. The host stores only a
-handle; state crosses the boundary only for intermediate aggregation or
-spilling.
-
-### Returning a pointer to `AbiResult`
-
-Returning a result-structure pointer requires another guest-memory read and a
-separate ownership rule for the structure. Wasmtime supports `v128`, which can
-carry the four `u32` fields directly. The design therefore returns a packed
-`v128`.
+Registration is **startup-only**: finish native registration first; do not run
+queries or mutate native/window registries concurrently. Velox's window map is
+not a concurrent hot-reload registry. Concurrent WASM registrations are
+serialized. Export validation executes bounded module start functions before
+publication. Every registry entry and replacement map is constructed first;
+nonthrowing map swaps then publish scalar, aggregate and window entries. A
+validation, collision or construction failure leaves the registries unchanged.
+This does not promise a live transaction to queries resolving several registries.
+
+SQL names are normalized before grouping/duplicate checks. A WASM scalar never
+shadows a native Simple Function or native VectorFunction, including with
+`overwrite=true`. Disjoint WASM scalar overloads from separate modules are
+merged. Without overwrite, a matching dispatch signature rejects the entire
+module; overwrite replaces only that signature, retaining other overloads.
+Dispatch identity includes argument types, type-variable eligibility and
+variadic shape, alpha-renames argument variables, and excludes return types,
+constant flags and integer-variable constraints. Changing those properties of
+the same dispatch slot requires overwrite. Aggregate overloads also merge/overwrite by dispatch slot; the corresponding
+window entry receives all signatures, with conservative aggregate metadata.
+Native aggregate/window names cannot be shadowed. The return count is the number
+of distinct scalar/aggregate SQL names declared by the incoming module.
+
+Aggregate registration also prepares the native `_partial`, `_merge`,
+`_merge_extract` and scalar `_extract` companions. Their signatures and
+return-type suffixes follow native AggregateCompanionSignatures. Generated names
+are validated before publication and refreshed when the source overload set
+changes; a collision rejects the whole module, including with overwrite enabled.
+Companions do not receive window aliases and are excluded from the return count.
+The native companion adapters forward raw constants. Return types must remain
+inferable from their intermediate types under native companion rules; typed
+intermediates preserve generic variables. These aliases primarily support
+planner aggregate modes. Native extract propagates whole-call UserError even
+under TRY; the WASM wrapper releases a failed extraction instance before any
+later API retry. See [UDAF alignment](wasm-udaf-parity.md) for examples and tests.
+
+## ABI and ownership
+
+The host supports ABI 1, 2 and 3. ABI 2 requires `row_api=true` and adds typed
+invocation errors. ABI 3 is restricted to row aggregates and adds retained-state
+size reports and a required compact entrypoint; generated row UDAFs declare ABI 3.
+Existing scalar and legacy aggregate declarations retain ABI 1. Export call
+signatures are identical, but ABI 3 success payloads have the layouts below;
+ABI 1/2 modules retain their original payload contracts.
+The allocator is
+`(i32)->i32`, free is `(i32,i32)->()`, scalar/batch exports are
+`(i32,i32)->v128`, aggregate create is `(i32)->v128` and single-group update is
+`(i32,i32,i32)->v128`. The v128 result contains four little-endian u32 lanes:
+status, output pointer, output length, reserved. Reserved must be zero;
+nonzero status is an invocation failure, not a recoverable scalar row error.
+Status 0 succeeds, 1 carries a legacy error message, and `0x100 + code` carries
+a native non-OK StatusCode (1–11) with its message as the output bytes. Code 1
+becomes VeloxUserError; codes 2–11 become VeloxRuntimeError, matching native
+EvalCtx::setStatus. Unknown nonzero statuses remain fatal protocol failures.
+Every failed invocation invalidates the Store, including typed UserError.
+Inputs and output allocations must be disjoint. The host copies output before
+freeing guest buffers. wasm32 addressing and the SIMD return are ABI choices.
+
+The transport profiles remain compatible across these versions. Legacy
+batch/aggregate exports retain
+their original Arrow physical types and i64-nanosecond timestamp range.
+`row_api=true` scalar declarations use logical markers for full TIMESTAMP
+(seconds/nanos), HUGEINT (high/low), arbitrary-byte VARCHAR and custom/OPAQUE
+bridges, recursively inside nested types. The host verifies the expected
+schema and required marker identities; unrecognized ABI versions or required
+markers are rejected. Optional metadata is not feature negotiation. An
+incompatible required extension needs a new ABI version or an explicitly
+specified capability negotiation protocol before adoption.
+
+Results contain exactly one record batch and one value column, optionally
+followed by nullable UTF-8 `__velox_wasm_error`. Row counts must match selected
+inputs, an error row must have a NULL value, and extra batches are rejected.
+Arrow 18 IPC is the current transport implementation. The host checks the
+expected logical/physical schema before constructing arrays, then checks one
+record batch, exact row counts, `ValidateFull`, Velox index bounds and no bytes
+after end-of-stream. Unsupported/dictionary schemas are rejected before data
+construction. Full validation includes offsets, child lengths, validity and
+DECIMAL precision. MAP bodies are first read with the identical LIST/STRUCT
+layout: Arrow's MapArray constructor would otherwise abort on NULL entries or
+keys before returning a validation Status. After validating those invariants,
+the host restores MAP descriptors while sharing the same value buffers.
+A key itself must be non-NULL, but nested key children may be NULL, as with
+native Simple Function views/writers and map_from_entries. The stricter
+indeterminate-key restriction belongs to the SQL map() constructor.
+Decoding depth is limited to 64.
+
+The host can retain IPC storage through imported vector ownership and charges
+it to the query MemoryPool until its last owner releases it. Arrow reader
+allocations, including decompression, use a bounded pool; its lifetime follows
+outstanding buffers. The default and current absolute IPC/decompression cap
+is 64 MiB, independently of guest linear memory. Borrowed decoder results
+copy variable-width leaves before the borrowed input is released.
+
+Scalar nested custom-codec outputs can retain their serialized payloads in
+native LazyVectors. Unused ROW fields, ARRAY elements and MAP values do not
+invoke the codec decoder until a consumer loads them. The first nonempty load
+materializes the entire codec column: native LazyVector loaders are single-use,
+and UDF results may be reused by consumers of other rows. This is column-level
+output deferral, not selective row decoding or guest-triggered host loading.
+MAP keys and invocation-scoped OPAQUE handles remain eager; top-level scalar
+codec results are materialized before returning from apply. Aggregate and
+borrowed-IPC decoding retain their eager contract. Owned-IPC callers can opt in
+with `ArrowIpcDecodeOptions::lazyCodecs`.
+
+The lazy vector retains IPC and MemoryPool ownership through full vector/base
+destruction. Its failure callback holds a weak Store reference, so results can
+outlive their producer without retaining guest memory or a dangling pointer.
+Decoder failures are fatal system errors, bypass TRY, discard partial decoded
+values and invalidate a live Store; repeated attempts cannot expose a partial
+vector. Schema, complete Arrow data, codec identity/version, payload presence,
+MAP key structure, handles and value/error exclusivity are checked before any
+lazy codec result is published. Serialized codec contents are interpreted on
+load. Ordinary ROW readers, sparse copying or downstream operators may force
+columns; the native LazyDereference path can preserve unused fields.
+
+## Errors and lifecycle
+
+Only a valid scalar error column creates recoverable row errors. SDK `Result`
+and `RowError` preserve TRY behavior; typed system Status remains fatal.
+A trap, deadline/fuel exhaustion, invalid IPC/ABI/handle or host bridge failure
+is a system failure, bypasses TRY and permanently invalidates the Store.
+The checked arithmetic examples return row errors for integer overflow;
+one bad row does not invalidate otherwise successful rows.
+
+Guest aggregate destroy is best effort and nonthrowing to native callers.
+A trap, bad acknowledgment or host allocation failure causes Store disposal;
+host group handles are cleared regardless. Store disposal does not depend on
+guest cleanup succeeding. This protects RowContainer destruction/unwinding.
+Aggregation serialize/merge offers an intermediate representation, but is not
+a claim of complete native memory-arbitration or spill efficiency parity.
+
+## Row aggregate contract
+
+`VeloxRowAggregate`/`#[velox_row_aggregate]` expose row inputs and owned group
+State, immutable serialize/finalize, and typed logical intermediate results.
+Native SignatureBinder supports variables/constraints, nested and variadic
+signatures across stages. Generated initialization supplies bound types,
+constant masks and declared configuration; State creation is per group.
+Original raw constants are not implicitly available in downstream merges.
+Default NULL behavior filters raw outer NULLs and keeps empty groups NULL;
+non-default merge also receives outer-NULL intermediate values. The legacy
+VARBINARY/ArrayRef aggregate ABI is retained without changing its transport.
+
+Whole aggregate bridge operations are serialized, including concurrent spill
+extraction. Create handles are nonzero/unique against live batches. Native
+window execution supplies constant inputs, and repeated extraction must not
+change accumulator contents. Row UDAFs implement toIntermediate through
+per-row temporary state creation/update/serialization/destruction. Typed
+intermediates work through partial/intermediate/final and spill operators.
+OPAQUE state requires serialization codecs; invocation handles cannot be kept
+across calls. Aggregate Err is an export failure, not a scalar row error column.
+`type Error = RowError` preserves native Status categories through create,
+update, serialize, merge, finalize and toIntermediate. Ordinary ToString errors
+retain the legacy fatal export-error contract. Error types must be `'static`;
+this does not impose a lifetime on borrowed Input views. A scalar whole-export
+typed UserError is still a fatal bridge failure under TRY; only its validated
+row-error column can produce a recoverable scalar error.
+Row aggregate State implements AggregateState. Primitives and owned standard
+values have recursive reserved-capacity accounting/compaction; structs can derive
+it and custom/shared allocators implement an explicit ownership policy. Guest
+inline State and its owned heap capacity are reported; Store bookkeeping and
+fragmentation remain covered by the accessible-page charge. Borrowed/OPAQUE invocation
+values cannot be retained as owned State.
+
+ABI 3 success payloads are little-endian 12-byte records `(u32 handle,u64 bytes)`:
+create reports all created groups; grouped update/merge reports every affected
+unique group once; single update/merge reports its one group. Serialize/finalize
+prefix unique-group records before their normal IPC result, so interior-cache
+growth is accounted after extraction. The host knows the affected handles and
+therefore the prefix length. Compact accepts one handle column and returns the
+same records after recursive capacity shrinking. Initialization/destroy return
+empty payloads; toIntermediate returns plain IPC after destroying temporary State.
+Unknown/duplicate/missing handles, invalid lengths, per-state bounds and total
+reported live-size overflow fail the entire call and invalidate Store. All reports
+are validated before row-size changes are published.
+
+Native row-size counters include this aggregate's State bytes and preserve other
+keys/aggregates; the prior report is stored beside its host handle. Row size is
+not another query-pool charge. Guest compact makes capacity reusable. With
+`state_checkpoint = "owned-v1"` and paired checkpoint/restore exports, the host
+can also rebuild a fragmented Store while groups remain active. It saves all
+owned State and the handle high-water mark to a query-owned buffer, validates
+membership/framing, releases old pages, initializes the same context and restores
+without calling create/merge. Every live group's size is updated, even when native
+compact receives a subset; native NULL flags and shared counters are preserved.
+Only the actual reduction from pages held at compact entry is returned as reclaimed
+bytes. Insufficient workspace or insufficient fragmentation returns zero, letting
+native continue to spill. No physical reduction is inferred from logical sizes.
+
+When the last group is successfully retired, the Store is released. Native
+spill/flush continues to use SQL intermediates, which need not preserve all private
+update state. Failed migrations invalidate the whole aggregate, including failure
+while constructing its replacement Store; cleanup safely removes native handles
+and only its own row-size contribution. Companions forward compact capability.
+The checkpoint feature is optional/additive to ABI 3 and an explicit owned-State
+reconstruction contract. Whole-Store snapshots need temporary capacity; streaming/
+segmented reclamation and exact non-linear runtime charging remain obligations in
+[UDAF alignment](wasm-udaf-parity.md).
+
+### Optional owned-State checkpoint protocol (ABI 3)
+
+Declarations specify `"state_checkpoint": "owned-v1"` and nonempty `checkpoint`
+and `restore` entrypoints. Both are required; unmarked entrypoints or an unknown
+protocol are rejected. Older ABI-3 hosts can ignore this capability. ABI-1/2
+modules keep their payloads and cannot declare it.
+
+- checkpoint: `(i32 maxOutputBytes) -> v128`; success returns owned raw bytes.
+- restore: `(i32 stateAllocationBudget, i32 pointer, i32 length) -> v128`;
+  success returns the ordinary `(u32 handle,u64 State bytes)` report for every
+  restored group. The target adapter must be initialized and empty.
+- Snapshot envelope: four ASCII bytes `VWS1`, little-endian `u32 nextHandle`,
+  `u32 stateCount`, followed by records `(u32 handle,u32 State length,State bytes)`.
+  Zero nextHandle preserves exhausted handle space. Handles are nonzero/unique,
+  match the host's entire live set, and are below nextHandle unless exhausted.
+  The SDK encodes records in handle order and rejects trailing/truncated bytes.
+- State encoding is private to the same compiled module: it includes owned fields,
+  float bits and full-width integers, preserving update configuration/caches that
+  SQL intermediate can omit. Lengths, allocations and recursive nesting are
+  checked. The standard codecs never retain invocation OPAQUE/borrowed values.
+  This is not a cross-version module upgrade or durable spill format.
+
+## Resource and cancellation contract
+
+| Resource | Current control |
+| --- | --- |
+| Module bytes | Bounded snapshot, default 64 MiB; metadata 1 MiB / 256 declarations |
+| Linear memory | Per-Store limiter, default 64 MiB; accessible pages charged to native MemoryPool before initial commitment and each growth |
+| Table storage | Finite per-table element limit (10,000) and table count (1) |
+| Stack | Wasmtime maximum 2 MiB |
+| Export execution | 100-million fuel units per exported call; finite positive policy |
+| Logical invocation deadline | 1 second by default, includes allocator, entrypoint and deallocator |
+| Cancellation | Epoch ticker every 10 ms; current Driver task token checked inside guest execution, including start |
+| Host output | Pointer/range/alias checks and configured output byte limit, default 64 MiB |
+| Arrow decoding | 64 MiB allocation budget, native MemoryPool charge, no decompression worker threads |
+
+Fuel is refreshed per export; it is not a query-wide CPU budget. Epoch polling
+is a scheduling mechanism, not a guaranteed real-time latency bound. Query
+Stores are created lazily after a pool and current task token are available;
+standalone callers can provide their own cancellation check and pool.
+The Wasmtime 39 host-memory creator charges accessible linear pages before
+making them readable/writable. It reserves the virtual address range and guard
+requested by Wasmtime, keeps the base pointer stable and commits only current
+pages. Those inaccessible reservations/guards are not charged as allocated
+query bytes. Committed address space is not a measurement of RSS. Newly grown
+pages are zero-filled. Growth callbacks capture their original Store/pool owner,
+including execution on another Driver thread. Pool allocation failures are
+remembered across the C/Rust callback and propagated as fatal native errors even
+if guest code handles memory.grow's -1. Constructor, allocator, entrypoint and
+free paths all check them; invalidation unmaps memory and releases the charge.
+
+Store attachment after standalone creation charges all currently accessible
+pages before subsequent query calls. The implementation uses guarded POSIX
+mappings, disables data-image CoW and shared/threaded guest memory, and accepts
+standard 64-KiB Wasm pages. Shared memory must not bypass the accounting callback.
+The current validation is on Linux; other supported host platforms still require
+build and resource tests. See the version-pinned [MemoryCreator contract](https://docs.rs/wasmtime/39.0.0/wasmtime/trait.MemoryCreator.html)
+and [C API implementation](https://github.com/bytecodealliance/wasmtime/blob/v39.0.0/crates/c-api/src/config.rs).
+
+Tables, JIT artifacts, compilation CPU, metadata objects and Wasmtime internal
+allocators are not exactly charged to the query pool. Deployment must bound
+active modules/instances, registration concurrency and process RSS, and should
+isolate compilation of adversarial modules. The registration path is privileged
+startup work. Neither linear limits nor epoch interruption control JIT work.
+There is no arbitrary guest access to MemoryPool, files, network or services.
+Only the exact typed `velox_udf_v1.lambda_call`, `lambda_call_batch` and
+`lambda_result` imports are allowed. Authority is bound exclusively to declared row UDAF lambdas in a query;
+scalar/legacy instances and module start have no callback authority. WASI and
+all other imports are rejected.
+
+### Aggregate lambda capability
+
+Row ABI 3 manifests can declare `lambda_callback = "ipc-v1"` and separate
+`lambdas` FUNCTION signatures. The Rust macro emits these fields from
+`#[velox_row_aggregate(..., lambdas = ["function(S,T,S)", ...])]`. Value argument
+tuples exclude the functions; `InitContext::lambda(index)` supplies a symbolic
+`Lambda`, whose `call(&[&Value])` returns an owned value. Generics/nested types
+bind through native SignatureBinder. IPC is internal to this callback.
+
+The call import returns a Store-local single-use result token and length. The
+read import validates exact token/length and guest range, copies, then consumes
+the charged result. Reentry into the guest allocator is unnecessary. Pending
+results cannot cross an invocation; malformed requests or response reads poison
+the Store. A `noexcept` native bridge captures evaluator exceptions and rethrows
+them after Wasmtime returns, preserving native error categories. Existing
+input/output byte limits apply, with per-export RPC and cumulative evaluation
+quotas, per-call row limits and task cancellation/deadline checks. The new
+`lambda_call_batch(i32,i32,i32,i32)->i64` additionally declares the exact row
+count, which native decoding validates before vector evaluation. Rust
+`Lambda::call_batch` takes borrowed Value columns with length-one broadcast.
+Optional `update_batch` / `merge_batch` methods consume iterators of ordinary
+row arguments/intermediate views; generated exports use those methods only
+when the author overrides them. Grouping keeps each group's input order and
+validates every handle before mutation. Native reduce-style mapping/tree
+combination replaces the per-row callback path in `ReduceWasm`. Guest fuel
+does not interrupt a synchronous native function mid-body. Further IPC and
+native optimization work remains. See [UDAF alignment](wasm-udaf-parity.md).
+The imports are an explicit additional ABI-3 capability. Earlier hosts that
+reject imports cannot load such a mixed module, including its scalar exports;
+this host continues to load older modules without these imports.
+
+Lambda formal parameters shadow identically named input fields. AggregateInfo
+passes lambda expressions separately without treating formal names as capture
+columns. Actual outer-column captures need an explicit evaluator/stage contract:
+both native ReduceAgg and the Wasm bridge currently provide only formal-parameter
+ROWs for evaluation. FUNCTION plus a final variadic tail is supported: functions
+follow the fixed value prefix and precede the tail. Rust row tuples and constant
+argument indices exclude functions. The native SQL resolver accepts expanded or
+empty tails, and SignatureBinder binds known value types after unresolved
+lambda placeholders. Variables used only by a generic tail still need a typed
+tail value for inference; a fixed-T value can bind an empty tail. Existing
+fixed-lambda manifests preserve their layout; older fixed-only hosts reject
+new variadic-lambda declarations.
+
+Independent merge/extract signatures may erase input-only generic lambda types.
+Those slots retain their declared positions with explicit
+`velox.lambda.types_bound.<index>=false` initialization metadata, omit input/output
+type descriptors, and cannot be evaluated. Rust `Lambda::has_bound_types()`
+reports that state; `call`, `call_batch` and row-limit access fail explicitly.
+Types required by the intermediate or result must still resolve. This allows
+callback-free companion stages without inventing a replacement for erased T.
+Knowing a lambda's types does not grant expression authority: any actual callback
+also requires the query's bound native expression/evaluator. Older typed-only
+SDKs ignore the new true marker and retain their ordinary behavior; they reject
+an unbound slot's missing type descriptors during initialization. New SDKs accept
+older fully typed messages without a marker. Callback-dependent independent
+companions still need an explicit expression-carrying planner/API contract.
+
+Native named ROW signatures check field names, while anonymous ROW signatures
+bind by position. The bridge resolves a compatible intermediate's Arrow field
+names before grouped/single merge, including nested ROWs inside ARRAY/MAP,
+without changing caller vectors or copying value buffers. It preserves wire
+markers and exact leaf/DECIMAL/custom/OPAQUE identity. Initial intermediate
+constants/placeholders use the same resolved type. This is an intermediate
+transport operation; raw/scalar binder rules remain native.
+
+Aggregate initialization also records whether its factory bound raw or
+intermediate input types. This differs from the operator step: native staged
+plans may construct a final operator using raw types. Direct merge constants
+use `velox.aggregate.intermediate_constant`; the raw configuration constant mask
+is cleared so intermediate data cannot be mistaken for an original parameter.
+`InitContext::aggregate_input_types()` and `intermediate_constant_value()` expose
+this contract. An intermediate constant is an initialization hint, not an initial
+contribution: merge still processes every selected row. Constant SQL NULL is
+distinguished from a missing/nonconstant hint. The common native scalar extract
+adapter does not supply constants to its aggregate factory. Typed direct merge
+instances reject raw update and do not advertise raw `toIntermediate`.
+
+## Validation and performance
+
+Build/run commands are in the [SDK README](../../functions/wasm/sdk/README.md).
+The standalone safety target covers malformed IPC, decompression limits,
+resource controls, cancellation, Store invalidation, collisions/overloads and
+cleanup. Full scalar/runtime/aggregate GTests and shared expression metadata
+regressions exercise execution integration. Passing these tests does not
+replace broader sanitizer/fuzzing and deployment load testing.
+
+The benchmark separately identifies checked native Simple Function add,
+matching nullable Simple Function prefix, built-in vector concat, native Simple
+Function ARRAY sum, and native aggregates. Registration, compilation, warmup,
+initialization and final destruction are outside steady-state batch timing.
+The 2026-10-02 results predate validation/epoch/accounting changes and must not
+be labeled current measurements. The benchmark now includes NULL, dictionary/constant, sparse-selection, large
+string, generic nested hash and variadic cases. These remain selected workloads,
+not a claim of broad performance parity. Guest view
+access is lazy, but the IPC batch is serialized eagerly; this is not end-to-end
+demand decoding. For fully selected inputs of matching length, the host can
+export ordinary ROW/ARRAY/MAP descriptors directly when their leaves are flat
+or scalar dictionary/constant vectors over supported flat storage. Arrow
+flattens only the encoded leaves, retaining plain sibling buffers. Selection
+indices are allocated only when a gather fallback needs them. Encoded complex
+values, UNKNOWN encodings and unloaded lazy bases keep the native gather
+fallback; the capability check does not load a lazy base. Sparse selection
+continues to copy only selected complex rows. IPC still copies payloads into
+guest memory, and this optimization does not provide native vector/value-hook
+pushdown or remove the transport boundary.
+
+The `arrowGatherPlainRow`/`arrowGatherDictionaryLeafRow`/
+`arrowGatherConstantLeafRow` benchmark cases diagnose host gather plus IPC
+serialization. They do not execute a guest or compare native Simple Functions.
+
+Guest BOOLEAN/TINYINT/SMALLINT/INTEGER/BIGINT/REAL/DOUBLE column construction
+reads borrowed scalar leaves or owned scalars directly into typed Arrow input,
+avoiding an intermediate owned Value vector. This is an SDK optimization for
+primitive outputs, nested primitive children and lambda arguments, preserving
+NULL/type checks and floating-point bit patterns. It does not remove IPC or
+change the row author interface, state ownership contract or guest ABI.
+
+A validated scalar business error keeps its native `VeloxUserError` category
+outside TRY and does not invalidate a healthy Store. Only exceptions from the
+validated error-reporting step receive this treatment; a UserError originating
+from a bridge/protocol failure remains fatal. All structured row-status payloads
+are validated before any business error can stop reporting, so a malformed
+later row cannot hide behind an earlier valid user error. Non-user statuses
+remain fatal and invalidate the Store, including inside TRY.
+
+## Borrowed generic operations and ASCII metadata
+
+`Generic::hash/compare/equals` traverse borrowed guest Arrow arrays instead of
+materializing whole SQL values. ARRAY/ROW comparisons short-circuit, while hash
+must read every element. MAP comparison sorts index vectors and borrows keys
+and values. Codec semantics borrow payload bytes; their headers and registry
+lookup may allocate. Owned `Value` operations do not clone trees. Mixed
+owned/borrowed comparison reads standard scalars, strings and reached nested
+children directly; MAP allocates sorted entry indices, while mixed custom codec
+comparison retains payload materialization and registered semantics. `sql_key`
+remains an explicit owned-value operation. Host input loading, IPC parsing and
+custom output codec decoding remain eager; this is guest-side demand decoding.
+
+The SDK emits optional scalar manifest `has_ascii=true` when a `call_ascii`
+alternate exists. That implementation requests native Expr input ASCII caching
+and passes its conservative batch flag as IPC schema metadata
+`velox.scalar.ascii_inputs=true|false`. NULL and nested strings do not affect
+the top-level VARCHAR decision. A missing key supports older hosts by scanning
+the guest batch once. The adapter selects the ASCII alternative once per batch.
+
+For all VARCHAR scalar results, the host computes ASCII state from actual
+returned bytes after scatter. No guest declaration can mark non-ASCII output
+as ASCII. This caches validated metadata on the vector returned by apply;
+expression-created dictionary wrappers have independent caches, as with native
+vectors. The native input-to-output preservation hook is intentionally unused
+because the guest's result is untrusted. The output scan is part of measured
+batch execution, not an untimed benchmark optimization.

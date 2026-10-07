@@ -18,6 +18,8 @@ velox_add_library(
   Manifest.cpp
   Registration.cpp
   Runtime.cpp
+  LinearMemory.cpp
+  TypeBridge.cpp
   WasmAggregate.cpp
   WasmVectorFunction.cpp
   HEADERS
@@ -26,6 +28,8 @@ velox_add_library(
   Manifest.h
   Registration.h
   Runtime.h
+  LinearMemory.h
+  TypeBridge.h
   WasmAggregate.h
   WasmVectorFunction.h
 )
@@ -44,7 +48,26 @@ velox_link_libraries(
 )
 
 if(VELOX_ENABLE_EXEC)
+  get_target_property(wasm_target velox_wasm_udf ALIASED_TARGET)
+  if(NOT wasm_target)
+    set(wasm_target velox_wasm_udf)
+  endif()
+  target_compile_definitions(${wasm_target} PRIVATE VELOX_WASM_HAS_EXEC)
   velox_link_libraries(velox_wasm_udf velox_exec)
+endif()
+
+if(NOT VELOX_ENABLE_EXEC)
+  # Standalone bridge tests still exercise the real native companion adapters
+  # and signature rules, using only the small Aggregate registry test shim.
+  get_target_property(wasm_target velox_wasm_udf ALIASED_TARGET)
+  if(NOT wasm_target)
+    set(wasm_target velox_wasm_udf)
+  endif()
+  target_sources(${wasm_target} PRIVATE
+    ${PROJECT_SOURCE_DIR}/velox/exec/AggregateCompanionAdapter.cpp
+    ${PROJECT_SOURCE_DIR}/velox/exec/AggregateCompanionSignatures.cpp
+    ${PROJECT_SOURCE_DIR}/velox/exec/AggregateFunctionRegistry.cpp
+  )
 endif()
 
 if(

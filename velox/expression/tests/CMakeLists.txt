@@ -55,6 +55,7 @@ add_executable(
   TryExprTest.cpp
   VariadicViewTest.cpp
   VectorReaderTest.cpp
+  VectorFunctionMetadataTest.cpp
 )
 velox_add_test_headers(velox_expression_test SpecialFormRewriteTestBase.h)
 if(VELOX_ENABLE_GEO)
@@ -161,4 +162,16 @@ target_link_libraries(
   velox_vector_test_lib
   GTest::gtest
   GTest::gtest_main
+)
+
+# A narrow target for shared metadata API regressions; no WASM dependency.
+add_executable(velox_vector_function_metadata_test VectorFunctionMetadataTest.cpp)
+target_link_libraries(
+  velox_vector_function_metadata_test
+  velox_expression
+  GTest::gtest_main
+)
+add_test(
+  NAME velox_vector_function_metadata_test
+  COMMAND velox_vector_function_metadata_test
 )

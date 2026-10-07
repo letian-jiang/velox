@@ -1,11 +1,22 @@
 /*
  * Minimal Aggregate base and registry definitions for the standalone Wasm UDF
- * test build. Full Velox builds link these definitions from velox_exec.
+ * test and native comparison benchmark. Full builds use velox_exec.
  */
 
 #include "velox/exec/Aggregate.h"
+#include "velox/exec/window/AggregateWindow.h"
 
 namespace facebook::velox::exec {
+
+bool isRawInput(core::AggregationNode::Step step) {
+  return step == core::AggregationNode::Step::kPartial ||
+      step == core::AggregationNode::Step::kSingle;
+}
+
+bool isPartialOutput(core::AggregationNode::Step step) {
+  return step == core::AggregationNode::Step::kPartial ||
+      step == core::AggregationNode::Step::kIntermediate;
+}
 
 AggregateFunctionMap& aggregateFunctions() {
   static AggregateFunctionMap functions;
@@ -20,6 +31,13 @@ const AggregateFunctionEntry* getAggregateFunctionEntry(
         auto it = functions.find(sanitizedName);
         return it == functions.end() ? nullptr : &it->second;
       });
+}
+
+std::optional<std::vector<AggregateFunctionSignaturePtr>>
+getAggregateFunctionSignatures(const std::string& name) {
+  if (const auto* entry = getAggregateFunctionEntry(name))
+    return entry->signatures;
+  return std::nullopt;
 }
 
 AggregateRegistrationResult registerAggregateFunction(
@@ -41,6 +59,26 @@ AggregateRegistrationResult registerAggregateFunction(
   return result;
 }
 
+std::vector<AggregateRegistrationResult> registerAggregateFunction(
+    const std::vector<std::string>& names,
+    const std::vector<std::shared_ptr<AggregateFunctionSignature>>& signatures,
+    const AggregateFunctionFactory& factory,
+    const AggregateFunctionMetadata& metadata,
+    bool registerCompanionFunctions,
+    bool overwrite) {
+  std::vector<AggregateRegistrationResult> results;
+  for (const auto& name : names) {
+    results.push_back(registerAggregateFunction(
+        name,
+        signatures,
+        factory,
+        metadata,
+        registerCompanionFunctions,
+        overwrite));
+  }
+  return results;
+}
+
 std::unique_ptr<Aggregate> Aggregate::create(
     const std::string& name,
     core::AggregationNode::Step step,
@@ -55,6 +93,13 @@ std::unique_ptr<Aggregate> Aggregate::create(
 
 void Aggregate::setAllocatorInternal(HashStringAllocator* allocator) {
   allocator_ = allocator;
+}
+
+void Aggregate::setLambdaExpressions(
+    std::vector<core::LambdaTypedExprPtr> expressions,
+    std::shared_ptr<core::ExpressionEvaluator> evaluator) {
+  lambdaExpressions_ = std::move(expressions);
+  expressionEvaluator_ = std::move(evaluator);
 }
 
 void Aggregate::setOffsetsInternal(
@@ -76,4 +121,24 @@ void Aggregate::clearInternal() {
   numNulls_ = 0;
 }
 
+} // namespace facebook::velox::exec
+
+namespace facebook::velox::exec {
+WindowFunctionMap& windowFunctions() {
+  static WindowFunctionMap functions;
+  return functions;
+}
+namespace window {
+WindowFunctionEntry makeAggregateWindowFunctionEntry(
+    const std::string&,
+    const std::vector<AggregateFunctionSignaturePtr>& signatures) {
+  return {
+      std::vector<FunctionSignaturePtr>(signatures.begin(), signatures.end()),
+      [](const auto&, const auto&, bool, auto*, auto*, const auto&)
+          -> std::unique_ptr<WindowFunction> {
+        VELOX_FAIL("Window execution is unavailable in the minimal test build");
+      },
+      {WindowFunction::ProcessMode::kRows, true}};
+}
+} // namespace window
 } // namespace facebook::velox::exec

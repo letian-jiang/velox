@@ -18,6 +18,7 @@
 #include "velox/core/Expressions.h"
 #include "velox/expression/Expr.h"
 #include "velox/expression/FieldReference.h"
+#include "velox/expression/VectorFunction.h"
 #include "velox/expression/VectorFunctionListener.h"
 #include "velox/functions/prestosql/registration/RegistrationFunctions.h"
 #include "velox/functions/prestosql/types/JsonType.h"
@@ -109,6 +110,85 @@ class ExprCompilerTest : public testing::Test,
   std::unique_ptr<core::ExecCtx> execCtx_{
       std::make_unique<core::ExecCtx>(pool_.get(), queryCtx_.get())};
 };
+
+TEST_F(ExprCompilerTest, lambdasBeforeVariadicValues) {
+  class TypeOnlyFunction final : public VectorFunction {
+    void apply(
+        const SelectivityVector&,
+        std::vector<VectorPtr>&,
+        const TypePtr&,
+        EvalCtx&,
+        VectorPtr&) const override {
+      VELOX_FAIL("Type-only test function must not execute");
+    }
+  };
+  auto signature = FunctionSignatureBuilder()
+                       .typeVariable("T")
+                       .returnType("bigint")
+                       .argumentType("function(T,bigint)")
+                       .argumentType("T")
+                       .variableArity()
+                       .build();
+  registerVectorFunction(
+      "test_lambda_before_tail",
+      {signature},
+      std::make_unique<TypeOnlyFunction>());
+  const auto rowType =
+      ROW({"a", "b", "bad"},
+          {ARRAY(BIGINT()), ARRAY(BIGINT()), MAP(BIGINT(), BIGINT())});
+  for (const std::string call :
+       {"test_lambda_before_tail(x -> cardinality(x), a)",
+        "test_lambda_before_tail(x -> cardinality(x), a, b, a, b)"}) {
+    auto expression = makeTypedExpr(call, rowType);
+    EXPECT_EQ(expression->type(), BIGINT());
+    const auto* lambda = dynamic_cast<const core::LambdaTypedExpr*>(
+        expression->inputs().at(0).get());
+    ASSERT_NE(lambda, nullptr);
+    EXPECT_EQ(*lambda->signature()->childAt(0), *ARRAY(BIGINT()));
+  }
+  VELOX_ASSERT_USER_THROW(
+      makeTypedExpr("test_lambda_before_tail(x -> cardinality(x))", rowType),
+      "Cannot infer lambda parameter types");
+  EXPECT_THROW(
+      makeTypedExpr(
+          "test_lambda_before_tail((x,y) -> cardinality(x), a)", rowType),
+      VeloxException);
+  EXPECT_THROW(
+      makeTypedExpr(
+          "test_lambda_before_tail(x -> cardinality(x), a, bad)", rowType),
+      VeloxException);
+
+  // A fixed argument binds T even when there are no variadic values.
+  auto prefix = FunctionSignatureBuilder()
+                    .typeVariable("T")
+                    .returnType("bigint")
+                    .argumentType("T")
+                    .argumentType("function(T,bigint)")
+                    .argumentType("T")
+                    .variableArity()
+                    .build();
+  registerVectorFunction(
+      "test_lambda_with_empty_tail",
+      {prefix},
+      std::make_unique<TypeOnlyFunction>());
+  auto empty = makeTypedExpr(
+      "test_lambda_with_empty_tail(a, x -> cardinality(x))", rowType);
+  EXPECT_EQ(empty->type(), BIGINT());
+
+  auto any = FunctionSignatureBuilder()
+                 .returnType("bigint")
+                 .argumentType("function(bigint,bigint)")
+                 .argumentType("any")
+                 .variableArity()
+                 .build();
+  registerVectorFunction(
+      "test_lambda_any_tail", {any}, std::make_unique<TypeOnlyFunction>());
+  for (const auto& call :
+       {"test_lambda_any_tail(x -> x)",
+        "test_lambda_any_tail(x -> x, a, bad, 7, 'text')"}) {
+    EXPECT_EQ(makeTypedExpr(call, rowType)->type(), BIGINT());
+  }
+}
 
 TEST_F(ExprCompilerTest, constantFolding) {
   auto rowType = ROW({"a"}, {BIGINT()});

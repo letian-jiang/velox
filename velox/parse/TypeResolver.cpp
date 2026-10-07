@@ -234,12 +234,23 @@ TypedExprPtr createWithImplicitCast(
   return std::make_shared<CallTypedExpr>(type, inputs, expr->name());
 }
 
+const exec::TypeSignature& signatureArgumentAt(
+    const exec::FunctionSignature& signature,
+    size_t index) {
+  // The final declared argument represents every actual variadic argument.
+  return signature.argumentTypeAt(
+      signature.variableArity()
+          ? std::min(index, signature.argumentTypes().size() - 1)
+          : index);
+}
+
 bool isLambdaArgument(
     const velox::exec::FunctionSignature& signature,
     size_t index,
     size_t numInputs) {
-  return signature.isLambdaArgumentAt(index) &&
-      (signature.argumentTypeAt(index).parameters().size() == numInputs + 1);
+  const auto& argument = signatureArgumentAt(signature, index);
+  return argument.baseName() == "function" &&
+      argument.parameters().size() == numInputs + 1;
 }
 
 } // namespace
@@ -401,7 +412,9 @@ bool isLambdaSignature(
 
   const auto numArguments = callExpr->inputs().size();
 
-  if (numArguments != signature.argumentTypes().size()) {
+  const auto numDeclared = signature.argumentTypes().size();
+  if (signature.variableArity() ? numArguments < numDeclared - 1
+                                : numArguments != numDeclared) {
     return false;
   }
 
@@ -490,7 +503,7 @@ TypedExprPtr Expressions::tryResolveCallWithLambdas(
   std::vector<TypedExprPtr> children(numArgs);
   std::vector<TypePtr> childTypes(numArgs);
   for (auto i = 0; i < numArgs; ++i) {
-    if (!signature->isLambdaArgumentAt(i)) {
+    if (signatureArgumentAt(*signature, i).baseName() != "function") {
       children[i] =
           inferTypes(callExpr->inputAt(i), inputRow, pool, complexConstants);
       childTypes[i] = children[i]->type();
@@ -501,11 +514,16 @@ TypedExprPtr Expressions::tryResolveCallWithLambdas(
   exec::SignatureBinder binder(*signature, childTypes, TypeCoercer::defaults());
   binder.tryBind();
   for (auto i = 0; i < numArgs; ++i) {
-    if (signature->isLambdaArgumentAt(i)) {
-      const auto& lambdaSignature = signature->argumentTypeAt(i);
+    if (signatureArgumentAt(*signature, i).baseName() == "function") {
+      const auto& lambdaSignature = signatureArgumentAt(*signature, i);
       const auto& params = lambdaSignature.parameters();
       const auto lambdaTypes = binder.tryResolveTypes(
           folly::Range(params.data(), params.size() - 1));
+      VELOX_USER_CHECK_EQ(
+          lambdaTypes.size(),
+          params.size() - 1,
+          "Cannot infer lambda parameter types for '{}'; provide typed value arguments",
+          callExpr->name());
 
       children[i] = inferTypes(
           callExpr->inputAt(i), inputRow, lambdaTypes, pool, complexConstants);

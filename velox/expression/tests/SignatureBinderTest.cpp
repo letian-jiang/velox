@@ -916,6 +916,39 @@ TEST(SignatureBinderTest, lambda) {
   }
 }
 
+TEST(SignatureBinderTest, bindKnownArgumentsAfterUnresolvedLambda) {
+  auto signature = exec::FunctionSignatureBuilder()
+                       .typeVariable("T")
+                       .returnType("bigint")
+                       .argumentType("function(T,bigint)")
+                       .argumentType("T")
+                       .variableArity()
+                       .build();
+  for (const auto& types :
+       {std::vector<TypePtr>{nullptr, ARRAY(BIGINT())},
+        std::vector<TypePtr>{nullptr, ARRAY(BIGINT()), ARRAY(BIGINT())}}) {
+    exec::SignatureBinder binder(*signature, types, TypeCoercer::defaults());
+    EXPECT_FALSE(binder.tryBind());
+    auto input =
+        binder.tryResolveType(signature->argumentTypeAt(0).parameters()[0]);
+    ASSERT_NE(input, nullptr);
+    EXPECT_EQ(*input, *ARRAY(BIGINT()));
+  }
+  // Missing placeholders in the variadic tail must never be dereferenced.
+  for (const auto& types :
+       {std::vector<TypePtr>{nullptr, nullptr, ARRAY(BIGINT())},
+        std::vector<TypePtr>{nullptr, ARRAY(BIGINT()), nullptr}}) {
+    exec::SignatureBinder binder(*signature, types, TypeCoercer::defaults());
+    EXPECT_FALSE(binder.tryBind());
+    std::vector<Coercion> coercions;
+    EXPECT_FALSE(binder.tryBindWithCoercions(coercions));
+  }
+  const std::vector<TypePtr> wrong{
+      FUNCTION({ARRAY(BIGINT())}, BIGINT()), ARRAY(BIGINT()), BIGINT()};
+  exec::SignatureBinder binder(*signature, wrong, TypeCoercer::defaults());
+  EXPECT_FALSE(binder.tryBind());
+}
+
 TEST(SignatureBinderTest, logicalType) {
   // Logical type as an argument type.
   {

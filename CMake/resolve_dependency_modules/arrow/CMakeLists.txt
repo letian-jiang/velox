@@ -71,6 +71,11 @@ if(VELOX_ENABLE_ARROW)
 
   velox_resolve_dependency_url(ARROW)
 
+  set(ARROW_BUILD_BYPRODUCTS ${ARROW_LIBDIR}/libarrow.a)
+  if(VELOX_BUILD_TESTING)
+    list(APPEND ARROW_BUILD_BYPRODUCTS ${ARROW_LIBDIR}/libarrow_testing.a)
+  endif()
+
   ExternalProject_Add(
     arrow_ep
     PREFIX ${ARROW_PREFIX}
@@ -78,7 +83,7 @@ if(VELOX_ENABLE_ARROW)
     URL_HASH ${VELOX_ARROW_BUILD_SHA256_CHECKSUM}
     SOURCE_SUBDIR cpp
     CMAKE_ARGS ${ARROW_CMAKE_ARGS}
-    BUILD_BYPRODUCTS ${ARROW_LIBDIR}/libarrow.a
+    BUILD_BYPRODUCTS ${ARROW_BUILD_BYPRODUCTS}
     PATCH_COMMAND
       patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/cmake-compatibility.patch && patch -p1 -i
       ${CMAKE_CURRENT_LIST_DIR}/arrow-testing-boost.patch
@@ -93,6 +98,20 @@ if(VELOX_ENABLE_ARROW)
   )
   set_target_properties(arrow PROPERTIES IMPORTED_LOCATION ${ARROW_LIBDIR}/libarrow.a)
   set_property(TARGET arrow PROPERTY INTERFACE_LINK_LIBRARIES ${RE2})
+  # Static Arrow references its enabled codecs even for uncompressed IPC.
+  # Keep those dependencies after libarrow.a on the consumer's link line.
+  find_package(ZLIB REQUIRED)
+  find_library(ARROW_LZ4_LIBRARY NAMES lz4 REQUIRED)
+  find_library(ARROW_SNAPPY_LIBRARY NAMES snappy REQUIRED)
+  find_library(ARROW_ZSTD_LIBRARY NAMES zstd REQUIRED)
+  target_link_libraries(
+    arrow
+    INTERFACE
+      ${ARROW_LZ4_LIBRARY}
+      ${ARROW_SNAPPY_LIBRARY}
+      ${ZLIB_LIBRARIES}
+      ${ARROW_ZSTD_LIBRARY}
+  )
   if(VELOX_BUILD_TESTING)
     add_library(arrow_testing STATIC IMPORTED GLOBAL)
     add_dependencies(arrow_testing arrow)

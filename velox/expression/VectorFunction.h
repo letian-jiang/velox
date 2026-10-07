@@ -260,7 +260,14 @@ using VectorFunctionFactory = std::function<std::shared_ptr<VectorFunction>(
 struct VectorFunctionEntry {
   std::vector<FunctionSignaturePtr> signatures;
   VectorFunctionFactory factory;
+  // Conservative name-level properties for callers without bound types.
   VectorFunctionMetadata metadata;
+  // Optional properties for each signature. Empty means uniform metadata.
+  std::vector<VectorFunctionMetadata> signatureMetadata;
+
+  const VectorFunctionMetadata& metadataAt(size_t index) const {
+    return signatureMetadata.empty() ? metadata : signatureMetadata.at(index);
+  }
 };
 
 // TODO: Use folly::Singleton here
@@ -289,13 +296,16 @@ VectorFunctionFactory makeVectorFunctionFactory() {
 // expression using input types and optionally constant values for some inputs.
 // When overwrite is true, any previously registered VectorFunction with the
 // name is replaced.
+// Optional signatureMetadata must have one entry per signature. Bound calls
+// receive that signature's properties; name-level metadata is conservative.
 // Returns true iff the function was inserted
 bool registerStatefulVectorFunction(
     std::string_view name,
     std::vector<FunctionSignaturePtr> signatures,
     VectorFunctionFactory factory,
     VectorFunctionMetadata metadata = {},
-    bool overwrite = true);
+    bool overwrite = true,
+    std::vector<VectorFunctionMetadata> signatureMetadata = {});
 
 } // namespace facebook::velox::exec
 

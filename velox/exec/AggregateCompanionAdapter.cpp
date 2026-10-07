@@ -16,12 +16,106 @@
 
 #include "velox/exec/AggregateCompanionAdapter.h"
 
+#include <cstring>
+
 #include "velox/exec/AggregateCompanionSignatures.h"
 #include "velox/exec/AggregateFunctionRegistry.h"
 #include "velox/exec/RowContainer.h"
 #include "velox/expression/SignatureBinder.h"
 
 namespace facebook::velox::exec {
+namespace {
+
+AggregateFunctionFactory makePartialFactory(const std::string& name) {
+  return [name](
+             core::AggregationNode::Step step,
+             const std::vector<TypePtr>& argTypes,
+             const TypePtr& resultType,
+             const core::QueryConfig& config) -> std::unique_ptr<Aggregate> {
+    if (auto func = getAggregateFunctionEntry(name)) {
+      if (!exec::isRawInput(step)) {
+        step = core::AggregationNode::Step::kIntermediate;
+      }
+      auto fn = func->factory(step, argTypes, resultType, config);
+      VELOX_CHECK_NOT_NULL(fn);
+      return std::make_unique<AggregateCompanionAdapter::PartialFunction>(
+          std::move(fn), resultType);
+    }
+    VELOX_FAIL(
+        "Original aggregation function {} not found: {}",
+        name,
+        CompanionSignatures::partialFunctionName(name));
+  };
+}
+
+AggregateFunctionFactory makeMergeFactory(const std::string& name) {
+  return [name](
+             core::AggregationNode::Step /*step*/,
+             const std::vector<TypePtr>& argTypes,
+             const TypePtr& resultType,
+             const core::QueryConfig& config) -> std::unique_ptr<Aggregate> {
+    if (auto func = getAggregateFunctionEntry(name)) {
+      auto fn = func->factory(
+          core::AggregationNode::Step::kIntermediate,
+          argTypes,
+          resultType,
+          config);
+      VELOX_CHECK_NOT_NULL(fn);
+      return std::make_unique<AggregateCompanionAdapter::MergeFunction>(
+          std::move(fn), resultType);
+    }
+    VELOX_FAIL(
+        "Original aggregation function {} not found: {}",
+        name,
+        CompanionSignatures::mergeFunctionName(name));
+  };
+}
+
+AggregateFunctionFactory makeMergeExtractFactory(
+    const std::string& name,
+    const std::string& mergeExtractFunctionName) {
+  return [name, mergeExtractFunctionName](
+             core::AggregationNode::Step step,
+             const std::vector<TypePtr>& argTypes,
+             const TypePtr& resultType,
+             const core::QueryConfig& config) -> std::unique_ptr<Aggregate> {
+    TypePtr functionResultType;
+    if (step == core::AggregationNode::Step::kFinal ||
+        step == core::AggregationNode::Step::kSingle) {
+      functionResultType = resultType;
+    } else {
+      // When step is kPartial or kIntermediate, 'resultType' is
+      // the intermediate type and the original result type needs to
+      // be resolved for the aggregate function creation.
+      const auto& originalResultType =
+          resolveResultType(mergeExtractFunctionName, argTypes);
+      if (!originalResultType) {
+        // Result type must be resolvable given intermediate type of
+        // the original UDAF.
+        VELOX_FAIL(
+            "Signatures' result types must be resolvable given intermediate types.");
+      }
+      functionResultType = originalResultType;
+    }
+
+    if (auto func = getAggregateFunctionEntry(name)) {
+      auto fn = func->factory(
+          core::AggregationNode::Step::kFinal,
+          argTypes,
+          functionResultType,
+          config);
+      VELOX_CHECK_NOT_NULL(fn);
+      return std::make_unique<AggregateCompanionAdapter::MergeExtractFunction>(
+          std::move(fn), resultType);
+    }
+    VELOX_FAIL(
+        "Original aggregation function {} not found: {}",
+        name,
+        mergeExtractFunctionName);
+  };
+}
+
+} // namespace
 
 void AggregateCompanionFunctionBase::setOffsetsInternal(
     int32_t offset,
@@ -51,6 +145,19 @@ bool AggregateCompanionFunctionBase::accumulatorUsesExternalMemory() const {
   return fn_->accumulatorUsesExternalMemory();
 }
 
+bool AggregateCompanionFunctionBase::supportsCompact() const {
+  return fn_->supportsCompact();
+}
+
+uint64_t AggregateCompanionFunctionBase::compact(folly::Range<char**> groups) {
+  return fn_->compact(groups);
+}
+
+void AggregateCompanionFunctionBase::setConstantInputs(
+    const std::vector<VectorPtr>& inputs) {
+  fn_->setConstantInputs(inputs);
+}
+
 bool AggregateCompanionFunctionBase::isFixedSize() const {
   return fn_->isFixedSize();
 }
@@ -76,12 +183,17 @@ void AggregateCompanionFunctionBase::clearInternal() {
 void AggregateCompanionFunctionBase::initializeNewGroups(
     char** groups,
     folly::Range<const vector_size_t*> indices) {
+  if (!lambdaExpressions_.empty())
+    fn_->setLambdaExpressions(lambdaExpressions_, expressionEvaluator_);
   fn_->initializeNewGroups(groups, indices);
 }
 
 void AggregateCompanionFunctionBase::initializeNewGroupsInternal(
     char** groups,
     folly::Range<const vector_size_t*> indices) {
+  if (!lambdaExpressions_.empty()) {
+    fn_->setLambdaExpressions(lambdaExpressions_, expressionEvaluator_);
+  }
   fn_->initializeNewGroups(groups, indices);
 }
 
@@ -190,6 +302,9 @@ char** AggregateCompanionAdapter::ExtractFunction::allocateGroups(
   auto alignment = fn_->accumulatorAlignmentSize();
   rows.applyToSelected([&](auto row) {
     groups[row] = allocationPool.allocateFixed(size + offsetInGroup, alignment);
+    // Flags and the shared variable-size counter must start at zero even when
+    // the allocation pool reuses memory from a prior extraction.
+    std::memset(groups[row], 0, offsetInGroup);
   });
   return groups;
 }
@@ -260,27 +375,7 @@ bool CompanionFunctionsRegistrar::registerPartialFunction(
   return exec::registerAggregateFunction(
              CompanionSignatures::partialFunctionName(name),
              std::move(partialSignatures),
-             [name](
-                 core::AggregationNode::Step step,
-                 const std::vector<TypePtr>& argTypes,
-                 const TypePtr& resultType,
-                 const core::QueryConfig& config)
-                 -> std::unique_ptr<Aggregate> {
-               if (auto func = getAggregateFunctionEntry(name)) {
-                 if (!exec::isRawInput(step)) {
-                   step = core::AggregationNode::Step::kIntermediate;
-                 }
-                 auto fn = func->factory(step, argTypes, resultType, config);
-                 VELOX_CHECK_NOT_NULL(fn);
-                 return std::make_unique<
-                     AggregateCompanionAdapter::PartialFunction>(
-                     std::move(fn), resultType);
-               }
-               VELOX_FAIL(
-                   "Original aggregation function {} not found: {}",
-                   name,
-                   CompanionSignatures::partialFunctionName(name));
-             },
+             makePartialFactory(name),
              metadata,
              /*registerCompanionFunctions*/ false,
              overwrite)
@@ -301,28 +396,7 @@ bool CompanionFunctionsRegistrar::registerMergeFunction(
   return exec::registerAggregateFunction(
              CompanionSignatures::mergeFunctionName(name),
              std::move(mergeSignatures),
-             [name](
-                 core::AggregationNode::Step /*step*/,
-                 const std::vector<TypePtr>& argTypes,
-                 const TypePtr& resultType,
-                 const core::QueryConfig& config)
-                 -> std::unique_ptr<Aggregate> {
-               if (auto func = getAggregateFunctionEntry(name)) {
-                 auto fn = func->factory(
-                     core::AggregationNode::Step::kIntermediate,
-                     argTypes,
-                     resultType,
-                     config);
-                 VELOX_CHECK_NOT_NULL(fn);
-                 return std::make_unique<
-                     AggregateCompanionAdapter::MergeFunction>(
-                     std::move(fn), resultType);
-               }
-               VELOX_FAIL(
-                   "Original aggregation function {} not found: {}",
-                   name,
-                   CompanionSignatures::mergeFunctionName(name));
-             },
+             makeMergeFactory(name),
              metadata,
              /*registerCompanionFunctions*/ false,
              overwrite)
@@ -339,47 +413,7 @@ bool registerMergeExtractFunctionInternal(
   return exec::registerAggregateFunction(
              mergeExtractFunctionName,
              std::move(mergeExtractSignatures),
-             [name, mergeExtractFunctionName](
-                 core::AggregationNode::Step step,
-                 const std::vector<TypePtr>& argTypes,
-                 const TypePtr& resultType,
-                 const core::QueryConfig& config)
-                 -> std::unique_ptr<Aggregate> {
-               TypePtr functionResultType;
-               if (step == core::AggregationNode::Step::kFinal ||
-                   step == core::AggregationNode::Step::kSingle) {
-                 functionResultType = resultType;
-               } else {
-                 // When step is kPartial or kIntermediate, 'resultType' is
-                 // the intermediate type and the original result type needs to
-                 // be resolved for the aggregate function creation.
-                 const auto& originalResultType =
-                     resolveResultType(mergeExtractFunctionName, argTypes);
-                 if (!originalResultType) {
-                   // Result type must be resolvable given intermediate type of
-                   // the original UDAF.
-                   VELOX_FAIL(
-                       "Signatures' result types must be resolvable given intermediate types.");
-                 }
-                 functionResultType = originalResultType;
-               }
-
-               if (auto func = getAggregateFunctionEntry(name)) {
-                 auto fn = func->factory(
-                     core::AggregationNode::Step::kFinal,
-                     argTypes,
-                     functionResultType,
-                     config);
-                 VELOX_CHECK_NOT_NULL(fn);
-                 return std::make_unique<
-                     AggregateCompanionAdapter::MergeExtractFunction>(
-                     std::move(fn), resultType);
-               }
-               VELOX_FAIL(
-                   "Original aggregation function {} not found: {}",
-                   name,
-                   mergeExtractFunctionName);
-             },
+             makeMergeExtractFactory(name, mergeExtractFunctionName),
              metadata,
              /*registerCompanionFunctions*/ false,
              overwrite)
@@ -529,6 +563,72 @@ bool CompanionFunctionsRegistrar::registerExtractFunction(
           .companionFunction(true)
           .build(),
       overwrite);
+}
+
+AggregateCompanionEntries CompanionFunctionsRegistrar::prepareEntries(
+    const std::string& originalName,
+    const std::vector<AggregateFunctionSignaturePtr>& signatures,
+    const AggregateFunctionMetadata& metadata) {
+  const auto name = sanitizeName(originalName);
+  AggregateCompanionEntries result;
+  auto companionMetadata = metadata;
+  companionMetadata.companionFunction = true;
+  auto partial = CompanionSignatures::partialFunctionSignatures(signatures);
+  if (!partial.empty()) {
+    result.aggregates.emplace(
+        CompanionSignatures::partialFunctionName(name),
+        AggregateFunctionEntry{
+            std::move(partial), makePartialFactory(name), companionMetadata});
+  }
+  auto merge = CompanionSignatures::mergeFunctionSignatures(signatures);
+  if (!merge.empty()) {
+    result.aggregates.emplace(
+        CompanionSignatures::mergeFunctionName(name),
+        AggregateFunctionEntry{
+            std::move(merge), makeMergeFactory(name), companionMetadata});
+  }
+  auto addFinal = [&](const std::string& mergeName,
+                      const std::string& extractName,
+                      const std::vector<AggregateFunctionSignaturePtr>& group) {
+    auto mergeExtract =
+        CompanionSignatures::mergeExtractFunctionSignatures(group);
+    if (!mergeExtract.empty()) {
+      result.aggregates.emplace(
+          mergeName,
+          AggregateFunctionEntry{
+              std::move(mergeExtract),
+              makeMergeExtractFactory(name, mergeName),
+              companionMetadata});
+    }
+    auto extract = CompanionSignatures::extractFunctionSignatures(group);
+    if (!extract.empty()) {
+      result.vectors.emplace(
+          extractName,
+          VectorFunctionEntry{
+              std::move(extract),
+              getVectorFunctionFactory(name),
+              VectorFunctionMetadataBuilder()
+                  .defaultNullBehavior(false)
+                  .companionFunction(true)
+                  .build()});
+    }
+  };
+  if (CompanionSignatures::hasSameIntermediateTypesAcrossSignatures(
+          signatures)) {
+    for (const auto& [type, group] :
+         CompanionSignatures::groupSignaturesByReturnType(signatures)) {
+      addFinal(
+          CompanionSignatures::mergeExtractFunctionNameWithSuffix(name, type),
+          CompanionSignatures::extractFunctionNameWithSuffix(name, type),
+          group);
+    }
+  } else {
+    addFinal(
+        CompanionSignatures::mergeExtractFunctionName(name),
+        CompanionSignatures::extractFunctionName(name),
+        signatures);
+  }
+  return result;
 }
 
 } // namespace facebook::velox::exec

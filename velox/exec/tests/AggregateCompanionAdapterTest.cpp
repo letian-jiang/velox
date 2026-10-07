@@ -494,6 +494,57 @@ TEST_F(AggregateCompanionRegistryTest, duplicateRegistration) {
                   .extractFunction);
 }
 
+TEST_F(
+    AggregateCompanionRegistryTest,
+    preparedEntriesAreUnpublishedAndMatchNativeRegistry) {
+  auto signature = AggregateFunctionSignatureBuilder()
+                       .returnType("double")
+                       .intermediateType("row(double,bigint)")
+                       .argumentType("double")
+                       .build();
+  AggregateFunctionMetadata metadata;
+  metadata.orderSensitive = false;
+  metadata.ignoreDuplicates = true;
+  auto prepared = CompanionFunctionsRegistrar::prepareEntries(
+      "PREPARED_NATIVE_AVG", {signature}, metadata);
+  ASSERT_EQ(prepared.aggregates.size(), 3);
+  ASSERT_EQ(prepared.vectors.size(), 1);
+  for (const auto& [name, entry] : prepared.aggregates) {
+    EXPECT_FALSE(getAggregateFunctionSignatures(name).has_value());
+    EXPECT_TRUE(entry.metadata.companionFunction);
+    EXPECT_TRUE(entry.metadata.ignoreDuplicates);
+    EXPECT_FALSE(entry.metadata.orderSensitive);
+  }
+  EXPECT_FALSE(
+      getVectorFunctionSignatures("prepared_native_avg_extract").has_value());
+  auto registered = registerAggregateFunction(
+      "prepared_native_avg",
+      {signature},
+      [](auto, const auto&, const auto&, const auto&)
+          -> std::unique_ptr<Aggregate> {
+        return nullptr; // Registry/signature test; never instantiated.
+      },
+      metadata,
+      true,
+      false);
+  EXPECT_TRUE(
+      registered.mainFunction && registered.partialFunction &&
+      registered.mergeFunction && registered.extractFunction &&
+      registered.mergeExtractFunction);
+  for (const auto& [name, entry] : prepared.aggregates) {
+    auto signatures = getAggregateFunctionSignatures(name);
+    ASSERT_TRUE(signatures.has_value());
+    ASSERT_EQ(signatures->size(), entry.signatures.size());
+    EXPECT_EQ((*signatures)[0]->toString(), entry.signatures[0]->toString());
+  }
+  const auto& extract = prepared.vectors.at("prepared_native_avg_extract");
+  auto signatures = getVectorFunctionSignatures("prepared_native_avg_extract");
+  ASSERT_TRUE(signatures.has_value());
+  EXPECT_EQ((*signatures)[0]->toString(), extract.signatures[0]->toString());
+  EXPECT_TRUE(extract.metadata.companionFunction);
+  EXPECT_FALSE(extract.metadata.defaultNullBehavior);
+}
+
 } // namespace
 
 } // namespace facebook::velox::exec::test

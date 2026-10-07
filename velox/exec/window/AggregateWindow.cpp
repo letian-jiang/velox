@@ -66,6 +66,12 @@ class AggregateWindowFunction : public exec::WindowFunction {
         resultType,
         config);
     aggregate_->setAllocator(stringAllocator_);
+    // Match AggregateInfo initialization, including constant SQL NULLs.
+    std::vector<VectorPtr> constants(args.size());
+    for (size_t i = 0; i < args.size(); ++i) {
+      constants[i] = args[i].constantValue;
+    }
+    aggregate_->setConstantInputs(constants);
 
     // Aggregate initialization.
     // Row layout is:
@@ -402,37 +408,37 @@ class AggregateWindowFunction : public exec::WindowFunction {
 
 } // namespace
 
-void registerAggregateWindowFunction(const std::string& name) {
-  auto aggregateFunctionSignatures = exec::getAggregateFunctionSignatures(name);
-  if (aggregateFunctionSignatures.has_value()) {
-    // This copy is needed to obtain a vector of the base FunctionSignaturePtr
-    // from the AggregateFunctionSignaturePtr type of
-    // aggregateFunctionSignatures variable.
-    std::vector<exec::FunctionSignaturePtr> signatures(
-        aggregateFunctionSignatures.value().begin(),
-        aggregateFunctionSignatures.value().end());
+exec::WindowFunctionEntry makeAggregateWindowFunctionEntry(
+    const std::string& name,
+    const std::vector<exec::AggregateFunctionSignaturePtr>&
+        aggregateSignatures) {
+  std::vector<exec::FunctionSignaturePtr> signatures(
+      aggregateSignatures.begin(), aggregateSignatures.end());
+  return {
+      std::move(signatures),
+      [name](
+          const std::vector<exec::WindowFunctionArg>& args,
+          const TypePtr& resultType,
+          bool ignoreNulls,
+          memory::MemoryPool* pool,
+          HashStringAllocator* stringAllocator,
+          const core::QueryConfig& config)
+          -> std::unique_ptr<exec::WindowFunction> {
+        return std::make_unique<AggregateWindowFunction>(
+            name, args, resultType, ignoreNulls, pool, stringAllocator, config);
+      },
+      {exec::WindowFunction::ProcessMode::kRows, true}};
+}
 
+void registerAggregateWindowFunction(const std::string& name) {
+  if (auto signatures = exec::getAggregateFunctionSignatures(name)) {
+    auto entry = makeAggregateWindowFunctionEntry(name, *signatures);
     exec::registerWindowFunction(
         name,
-        std::move(signatures),
-        {exec::WindowFunction::ProcessMode::kRows, true},
-        [name](
-            const std::vector<exec::WindowFunctionArg>& args,
-            const TypePtr& resultType,
-            bool ignoreNulls,
-            velox::memory::MemoryPool* pool,
-            HashStringAllocator* stringAllocator,
-            const core::QueryConfig& config)
-            -> std::unique_ptr<exec::WindowFunction> {
-          return std::make_unique<AggregateWindowFunction>(
-              name,
-              args,
-              resultType,
-              ignoreNulls,
-              pool,
-              stringAllocator,
-              config);
-        });
+        std::move(entry.signatures),
+        entry.metadata,
+        std::move(entry.factory));
   }
 }
+
 } // namespace facebook::velox::exec::window

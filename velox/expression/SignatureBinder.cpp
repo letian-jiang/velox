@@ -162,6 +162,7 @@ bool SignatureBinder::tryBind(
     }
   }
 
+  bool fullyBound = true;
   for (auto i = 0; i < numFormalArgs && i < numActualTypes; i++) {
     if (actualTypes_[i]) {
       if (allowCoercions) {
@@ -175,13 +176,18 @@ bool SignatureBinder::tryBind(
         }
       }
     } else {
-      return false;
+      // Lambda types are initially absent. Continue binding known arguments
+      // after them, including the first variadic value.
+      fullyBound = false;
     }
   }
 
   if (signature_.variableArity()) {
     if (!isAny(signature_.argumentTypes().back())) {
       if (numActualTypes > numFormalArgs) {
+        if (!actualTypes_[numFormalArgs - 1]) {
+          return false;
+        }
         if (allowCoercions) {
           auto firstType = actualTypes_[numFormalArgs - 1];
           if (coercions[numFormalArgs - 1].type != nullptr) {
@@ -189,6 +195,10 @@ bool SignatureBinder::tryBind(
           }
 
           for (auto i = numFormalArgs; i < numActualTypes; i++) {
+            if (!actualTypes_[i]) {
+              fullyBound = false;
+              continue;
+            }
             if (auto coercion = coercer_.coerce(actualTypes_[i], firstType)) {
               if (coercion->cost > 0) {
                 coercions[i] = Coercion{firstType, coercion->cost};
@@ -201,6 +211,10 @@ bool SignatureBinder::tryBind(
         } else {
           const auto& firstType = actualTypes_[numFormalArgs - 1];
           for (auto i = numFormalArgs; i < numActualTypes; i++) {
+            if (!actualTypes_[i]) {
+              fullyBound = false;
+              continue;
+            }
             if (!firstType->equivalent(*actualTypes_[i])) {
               return false;
             }
@@ -210,7 +224,7 @@ bool SignatureBinder::tryBind(
     }
   }
 
-  return true;
+  return fullyBound;
 }
 
 bool SignatureBinderBase::checkOrSetLongEnumParameter(

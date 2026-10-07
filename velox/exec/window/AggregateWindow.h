@@ -15,8 +15,16 @@
  */
 #pragma once
 #include <string>
+#include "velox/exec/Aggregate.h"
+#include "velox/exec/WindowFunction.h"
 
 namespace facebook::velox::exec::window {
+
+// Construct without consulting or mutating registries, for transactional
+// startup.
+exec::WindowFunctionEntry makeAggregateWindowFunctionEntry(
+    const std::string& name,
+    const std::vector<exec::AggregateFunctionSignaturePtr>& signatures);
 
 void registerAggregateWindowFunction(const std::string& name);
 

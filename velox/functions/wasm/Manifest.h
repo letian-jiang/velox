@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "velox/expression/FunctionSignature.h"
 #include "velox/type/Type.h"
 
 namespace facebook::velox::functions::wasm {
@@ -34,8 +35,11 @@ struct ScalarManifest {
   std::filesystem::path wasmPath;
   std::string name;
   std::string entrypoint;
-  std::vector<ManifestType> arguments;
-  ManifestType returnType;
+  exec::FunctionSignaturePtr signature;
+  std::string initializeEntrypoint;
+  std::vector<std::string> configKeys;
+  bool rowApi;
+  bool hasAscii;
   bool deterministic;
   bool defaultNullBehavior;
 };
@@ -49,6 +53,10 @@ struct AggregateEntrypoints {
   std::string merge;
   std::string mergeSingleGroup;
   std::string finalize;
+  std::string toIntermediate;
+  std::string compact;
+  std::string checkpoint;
+  std::string restore;
 };
 
 struct AggregateManifest {
@@ -62,6 +70,11 @@ struct AggregateManifest {
   bool orderSensitive;
   bool ignoreDuplicates;
   bool defaultNullBehavior;
+  exec::AggregateFunctionSignaturePtr signature;
+  std::string initializeEntrypoint;
+  std::vector<std::string> configKeys;
+  bool rowApi{false};
+  uint32_t lambdaCount{0};
 };
 
 struct EmbeddedManifests {
@@ -69,7 +82,15 @@ struct EmbeddedManifests {
   std::vector<AggregateManifest> aggregates;
 };
 
+std::string signatureType(const TypePtr& type);
+// Dispatch identity excludes return types and alpha-renames argument variables.
+std::string scalarDispatchKey(const exec::FunctionSignature& signature);
+
 /// Reads all Velox UDF declarations from the velox.udf.v1 custom section.
 EmbeddedManifests loadEmbeddedManifests(const std::filesystem::path& wasmPath);
+// Parse the same immutable bytes that are compiled by the runtime.
+EmbeddedManifests loadEmbeddedManifests(
+    const std::filesystem::path& wasmPath,
+    std::string_view bytes);
 
 } // namespace facebook::velox::functions::wasm

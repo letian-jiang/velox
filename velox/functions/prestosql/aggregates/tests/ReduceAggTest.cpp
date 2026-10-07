@@ -48,6 +48,24 @@ class ReduceAggTest : public functions::aggregate::test::AggregationTestBase {
   }
 };
 
+TEST_F(ReduceAggTest, lambdaParametersShadowInputColumns) {
+  auto input = makeRowVector(
+      {"key", "value"},
+      {makeFlatVector<int64_t>({0, 0, 1, 1, 2}),
+       makeNullableFlatVector<int64_t>({1, 2, 3, 4, std::nullopt})});
+  const std::string call =
+      "reduce_agg(value, 0, (key,value) -> key+value, (value,key) -> value+key)";
+  testAggregations(
+      {input}, {}, {call}, {makeRowVector({makeFlatVector<int64_t>({10})})});
+  testAggregations(
+      {input},
+      {"key"},
+      {call},
+      {makeRowVector(
+          {makeFlatVector<int64_t>({0, 1, 2}),
+           makeNullableFlatVector<int64_t>({3, 7, std::nullopt})})});
+}
+
 TEST_F(ReduceAggTest, integersGlobal) {
   auto data = makeRowVector(
       {"c0", "c1", "m"},

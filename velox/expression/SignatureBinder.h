@@ -121,7 +121,8 @@ class SignatureBinder : private SignatureBinderBase {
       const TypeCoercer& coercer)
       : SignatureBinderBase{signature, coercer}, actualTypes_{actualTypes} {}
 
-  /// Returns true if successfully resolved all generic type names.
+  /// Returns true if successfully resolved all generic type names. Missing
+  /// lambda types return false, while still binding later known arguments.
   bool tryBind();
 
   /// Like 'tryBind', but allows implicit type conversion if actualTypes don't

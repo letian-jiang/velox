@@ -16,6 +16,10 @@
 
 #pragma once
 
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+
 #include "velox/exec/Aggregate.h"
 #include "velox/functions/wasm/Manifest.h"
 #include "velox/functions/wasm/Runtime.h"
@@ -27,11 +31,25 @@ class WasmAggregate final : public exec::Aggregate {
   WasmAggregate(
       TypePtr resultType,
       AggregateManifest manifest,
-      std::shared_ptr<WasmModule> module);
+      std::shared_ptr<WasmModule> module,
+      const WasmOptions& options = {},
+      std::vector<TypePtr> inputTypes = {},
+      std::unordered_map<std::string, std::string> config = {},
+      std::vector<TypePtr> lambdaTypes = {},
+      bool rawInputTypes = true);
+
+  void setConstantInputs(const std::vector<VectorPtr>& inputs) override;
+  bool supportsToIntermediate() const override;
+  void toIntermediate(
+      const SelectivityVector& rows,
+      std::vector<VectorPtr>& args,
+      VectorPtr& result) const override;
 
   int32_t accumulatorFixedWidthSize() const override;
   bool accumulatorUsesExternalMemory() const override;
   bool isFixedSize() const override;
+  bool supportsCompact() const override;
+  uint64_t compact(folly::Range<char**> groups) override;
 
   void addRawInput(
       char** groups,
@@ -65,6 +83,16 @@ class WasmAggregate final : public exec::Aggregate {
   void destroyInternal(folly::Range<char**> groups) override;
 
  private:
+  ArrowIpcInput
+  evaluateLambda(uint32_t index, std::string_view input, uint32_t rows) const;
+  bool reportsStateSize() const;
+  void applyUsage(
+      const std::unordered_map<uint32_t, char*>& groups,
+      std::string_view report);
+  uint64_t stateSize(char* group) const;
+  void setStateSize(char* group, uint64_t bytes);
+  void ensureInstance() const;
+  void validateRawConstants() const;
   uint32_t handle(char* group) const;
   void setHandle(char* group, uint32_t handle) const;
   SelectivityVector filterRawRows(
@@ -91,7 +119,23 @@ class WasmAggregate final : public exec::Aggregate {
   void requireNoOutput(std::string_view entrypoint, std::string output) const;
 
   AggregateManifest manifest_;
-  WasmInstance instance_;
+  std::shared_ptr<WasmModule> module_;
+  WasmOptions options_;
+  mutable std::unique_ptr<WasmInstance> instance_;
+  std::vector<TypePtr> inputTypes_;
+  const bool rawInputTypes_;
+  std::vector<bool> rawConstantFlags_;
+  std::vector<TypePtr> lambdaTypes_;
+  mutable std::vector<std::shared_ptr<exec::ExprSet>> lambdaExprSets_;
+  std::vector<VectorPtr> constantInputs_;
+  std::unordered_map<std::string, std::string> config_;
+  std::unordered_map<uint32_t, char*> activeHandles_;
+  mutable uint64_t baseMemoryBytes_{0};
+  bool failed_{false};
+  uint64_t stateBytes_{0};
+  // extractAccumulators may run concurrently for spill. Serialize the entire
+  // bridge operation, including lazy instance creation and failure handling.
+  mutable std::recursive_mutex mutex_;
 };
 
 } // namespace facebook::velox::functions::wasm

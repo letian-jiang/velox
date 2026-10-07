@@ -21,9 +21,14 @@
 namespace facebook::velox::functions::wasm {
 
 constexpr uint32_t kAbiVersion = 1;
+constexpr uint32_t kNativeStatusAbiVersion = 2;
+constexpr uint32_t kStateAccountingAbiVersion = 3;
 constexpr const char* kMemoryExport = "memory";
 constexpr const char* kAllocExport = "velox_wasm_alloc";
 constexpr const char* kFreeExport = "velox_wasm_free";
+// 0 succeeds; 1 carries a legacy UTF-8 invocation failure. Tagged values
+// encode a non-OK velox::StatusCode and carry its UTF-8 message directly.
+constexpr uint32_t kNativeStatusBase = 0x100;
 
 struct AbiResult {
   uint32_t status;

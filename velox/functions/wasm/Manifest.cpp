@@ -15,6 +15,7 @@
  */
 
 #include "velox/functions/wasm/Manifest.h"
+#include "velox/functions/wasm/Runtime.h"
 
 #include <fstream>
 #include <sstream>
@@ -26,9 +27,89 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/functions/wasm/Abi.h"
+#include "velox/functions/wasm/TypeBridge.h"
 #include "velox/type/fbhive/HiveTypeParser.h"
 
 namespace facebook::velox::functions::wasm {
+namespace {
+
+std::string quoteRowName(std::string_view name) {
+  std::string quoted = "\"";
+  for (const auto character : name) {
+    if (character == '"') {
+      quoted += '"';
+    }
+    quoted += character;
+  }
+  return quoted + '"';
+}
+
+} // namespace
+
+std::string signatureType(const TypePtr& type) {
+  if (isBridgedType(type)) {
+    if (type->kind() == TypeKind::OPAQUE) {
+      return "opaque";
+    }
+    std::string name = type->name();
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+      return std::tolower(c);
+    });
+    return name;
+  }
+  if (type->isDecimal()) {
+    auto [precision, scale] = getDecimalPrecisionScale(*type);
+    return fmt::format("decimal({},{})", precision, scale);
+  }
+  if (type->isDate()) {
+    return "date";
+  }
+  switch (type->kind()) {
+    case TypeKind::UNKNOWN:
+      return "unknown";
+    case TypeKind::BOOLEAN:
+      return "boolean";
+    case TypeKind::TINYINT:
+      return "tinyint";
+    case TypeKind::SMALLINT:
+      return "smallint";
+    case TypeKind::INTEGER:
+      return "integer";
+    case TypeKind::BIGINT:
+      return "bigint";
+    case TypeKind::HUGEINT:
+      return "hugeint";
+    case TypeKind::REAL:
+      return "real";
+    case TypeKind::DOUBLE:
+      return "double";
+    case TypeKind::VARCHAR:
+      return "varchar";
+    case TypeKind::VARBINARY:
+      return "varbinary";
+    case TypeKind::TIMESTAMP:
+      return "timestamp";
+    case TypeKind::ARRAY:
+      return "array(" + signatureType(type->childAt(0)) + ")";
+    case TypeKind::MAP:
+      return "map(" + signatureType(type->childAt(0)) + "," +
+          signatureType(type->childAt(1)) + ")";
+    case TypeKind::ROW: {
+      std::string result = "row(";
+      for (size_t index = 0; index < type->size(); ++index) {
+        if (index != 0) {
+          result += ",";
+        }
+        result += quoteRowName(type->asRow().nameOf(index)) + " " +
+            signatureType(type->childAt(index));
+      }
+      return result + ")";
+    }
+    default:
+      VELOX_UNREACHABLE("Unsupported Wasm UDF signature type");
+  }
+}
+
 namespace {
 
 constexpr std::string_view kMetadataSection = "velox.udf.v1";
@@ -47,9 +128,22 @@ const folly::dynamic& required(
   return object[field];
 }
 
+void validateTypeDepth(std::string_view type) {
+  size_t depth = 0;
+  for (char byte : type) {
+    if (byte == '(' || byte == '<') {
+      VELOX_USER_CHECK_LE(++depth, 64, "Wasm type nesting exceeds 64");
+    } else if (byte == ')' || byte == '>') {
+      if (depth > 0)
+        --depth;
+    }
+  }
+}
+
 TypePtr parseTypeName(
     const std::string& name,
     const std::filesystem::path& path) {
+  validateTypeDepth(name);
   if (name.find('<') != std::string::npos) {
     auto type = type::fbhive::HiveTypeParser().parse(name);
     VELOX_USER_CHECK(
@@ -183,11 +277,18 @@ void validateVersionAndKind(
   const auto& version = required(root, "abi_version", path);
   const auto& actualKind = required(root, "kind", path);
   VELOX_USER_CHECK(version.isInt(), "Wasm UDF abi_version must be an integer");
-  VELOX_USER_CHECK_EQ(
-      version.asInt(),
-      kAbiVersion,
+  VELOX_USER_CHECK(
+      version.asInt() == kAbiVersion ||
+          version.asInt() == kNativeStatusAbiVersion ||
+          version.asInt() == kStateAccountingAbiVersion,
       "Unsupported Wasm UDF ABI version in '{}'",
       path.string());
+  VELOX_USER_CHECK(
+      version.asInt() == kAbiVersion || optionalBool(root, "row_api", false),
+      "Wasm ABI 2/3 requires the row API transport profile");
+  VELOX_USER_CHECK(
+      version.asInt() != kStateAccountingAbiVersion || kind == "aggregate",
+      "Wasm ABI 3 requires an aggregate declaration");
   VELOX_USER_CHECK(
       actualKind.isString() && actualKind.asString() == kind,
       "Expected a '{}' Wasm UDF declaration in '{}'",
@@ -195,17 +296,120 @@ void validateVersionAndKind(
       path.string());
 }
 
+// Scalar signatures use Velox's SQL signature syntax, including nested
+// variables. Older SDKs emit Hive syntax or structured concrete declarations.
+std::string scalarSignatureType(
+    const folly::dynamic& declaration,
+    const std::filesystem::path& path) {
+  const auto name = requiredString(declaration, "type", path);
+  validateTypeDepth(name);
+  VELOX_USER_CHECK(
+      required(declaration, "nullable", path).isBool(),
+      "Wasm UDF nullable must be a boolean");
+  if (name.find('<') != std::string::npos || name == "array" || name == "map" ||
+      name == "row") {
+    return signatureType(parseTypeDeclaration(declaration, path));
+  }
+  return name;
+}
+
 ScalarManifest parseScalar(
     const folly::dynamic& root,
-    const std::filesystem::path& path) {
-  validateVersionAndKind(root, path, "scalar");
+    const std::filesystem::path& path,
+    bool validateDeclaration = true) {
+  if (validateDeclaration)
+    validateVersionAndKind(root, path, "scalar");
+  exec::FunctionSignatureBuilder builder;
+  if (root.count("type_variables")) {
+    const auto& variables = root["type_variables"];
+    VELOX_USER_CHECK(variables.isObject(), "type_variables must be an object");
+    for (const auto& item : variables.items()) {
+      VELOX_USER_CHECK(
+          item.second.isString(), "type variable constraint must be a string");
+      const auto name = item.first.asString();
+      const auto constraint = item.second.asString();
+      if (constraint == "any") {
+        builder.typeVariable(name);
+      } else if (constraint == "known") {
+        builder.knownTypeVariable(name);
+      } else if (constraint == "comparable") {
+        builder.comparableTypeVariable(name);
+      } else if (constraint == "orderable") {
+        builder.orderableTypeVariable(name);
+      } else if (
+          constraint == "known&comparable" || constraint == "known&orderable") {
+        builder.variable(
+            exec::SignatureVariable(
+                name,
+                std::nullopt,
+                exec::ParameterType::kTypeParameter,
+                true,
+                constraint == "known&orderable",
+                true));
+      } else {
+        VELOX_USER_FAIL(
+            "Unsupported type variable constraint '{}'", constraint);
+      }
+    }
+  }
+  if (root.count("integer_variables")) {
+    const auto& variables = root["integer_variables"];
+    VELOX_USER_CHECK(
+        variables.isObject(), "integer_variables must be an object");
+    for (const auto& item : variables.items()) {
+      VELOX_USER_CHECK(
+          item.second.isString(),
+          "integer variable constraint must be a string");
+      VELOX_USER_CHECK_LE(
+          item.second.asString().size(),
+          512,
+          "Wasm integer constraint exceeds 512 bytes");
+      validateTypeDepth(item.second.asString());
+      builder.integerVariable(item.first.asString(), item.second.asString());
+    }
+  }
+  const auto& arguments = required(root, "arguments", path);
+  VELOX_USER_CHECK(arguments.isArray(), "Wasm UDF arguments must be an array");
+  for (const auto& argument : arguments) {
+    auto type = scalarSignatureType(argument, path);
+    if (optionalBool(argument, "constant", false)) {
+      builder.constantArgumentType(type);
+    } else {
+      builder.argumentType(type);
+    }
+  }
+  if (optionalBool(root, "variable_arity", false)) {
+    VELOX_USER_CHECK(
+        !arguments.empty(), "Variadic signature needs a tail argument");
+    builder.variableArity();
+  }
+  builder.returnType(scalarSignatureType(required(root, "return", path), path));
+  std::string initialize;
+  if (root.count("initialize")) {
+    initialize = requiredString(root, "initialize", path);
+  }
+  std::vector<std::string> configKeys;
+  if (root.count("config_keys")) {
+    VELOX_USER_CHECK(!initialize.empty(), "config_keys requires initialize");
+    VELOX_USER_CHECK(
+        root["config_keys"].isArray(), "config_keys must be an array");
+    for (const auto& key : root["config_keys"]) {
+      VELOX_USER_CHECK(
+          key.isString() && !key.asString().empty(),
+          "config_keys must contain non-empty strings");
+      configKeys.push_back(key.asString());
+    }
+  }
   return {
-      .abiVersion = kAbiVersion,
+      .abiVersion = static_cast<uint32_t>(root["abi_version"].asInt()),
       .wasmPath = path,
       .name = requiredString(root, "name", path),
       .entrypoint = requiredString(root, "entrypoint", path),
-      .arguments = parseArguments(root, path),
-      .returnType = parseManifestType(required(root, "return", path), path),
+      .signature = builder.build(),
+      .initializeEntrypoint = std::move(initialize),
+      .configKeys = std::move(configKeys),
+      .rowApi = optionalBool(root, "row_api", false),
+      .hasAscii = optionalBool(root, "has_ascii", false),
       .deterministic = optionalBool(root, "deterministic", true),
       .defaultNullBehavior = optionalBool(root, "default_null_behavior", true),
   };
@@ -218,13 +422,109 @@ AggregateManifest parseAggregate(
   const auto& exports = required(root, "entrypoints", path);
   VELOX_USER_CHECK(
       exports.isObject(), "Wasm UDAF entrypoints must be an object");
-  auto intermediate =
-      parseManifestType(required(root, "intermediate", path), path);
-  VELOX_USER_CHECK(
-      intermediate.type->kind() == TypeKind::VARBINARY,
-      "Wasm UDAF intermediate type must be varbinary");
+  const bool rowApi = optionalBool(root, "row_api", false);
+  exec::AggregateFunctionSignaturePtr signature;
+  std::vector<ManifestType> arguments;
+  ManifestType intermediate{nullptr, true};
+  ManifestType result{nullptr, true};
+  std::string initialize;
+  std::vector<std::string> configKeys;
+  uint32_t lambdaCount = 0;
+  if (root.count("lambdas")) {
+    const auto& lambdas = root["lambdas"];
+    VELOX_USER_CHECK(
+        lambdas.isArray() && !lambdas.empty() && lambdas.size() <= 64,
+        "Wasm UDAF lambdas must contain 1..64 function signatures");
+    VELOX_USER_CHECK(
+        rowApi && root["abi_version"].asInt() == kStateAccountingAbiVersion,
+        "Wasm UDAF lambdas require row ABI 3");
+    VELOX_USER_CHECK_EQ(
+        requiredString(root, "lambda_callback", path),
+        "ipc-v1",
+        "Unsupported Wasm lambda callback protocol");
+    lambdaCount = lambdas.size();
+  } else {
+    VELOX_USER_CHECK(
+        !root.count("lambda_callback"),
+        "Wasm lambda protocol requires lambda signatures");
+  }
+  if (rowApi) {
+    auto scalarRoot = root;
+    if (lambdaCount) {
+      const auto& values = required(root, "arguments", path);
+      VELOX_USER_CHECK(values.isArray(), "Wasm UDF arguments must be an array");
+      const bool variadic = optionalBool(root, "variable_arity", false);
+      VELOX_USER_CHECK(
+          !variadic || !values.empty(),
+          "Variadic signature needs a tail argument");
+      // Functions are fixed arguments: insert them between the fixed value
+      // prefix and the final variadic value type, or after all fixed values.
+      folly::dynamic combined = folly::dynamic::array;
+      const auto fixed = values.size() - (variadic ? 1 : 0);
+      for (size_t i = 0; i < fixed; ++i)
+        combined.push_back(values[i]);
+      for (const auto& lambda : root["lambdas"]) {
+        VELOX_USER_CHECK(
+            lambda.isString(), "Wasm lambda signature must be a string");
+        validateTypeDepth(lambda.asString());
+        auto type = exec::parseTypeSignature(lambda.asString());
+        VELOX_USER_CHECK(
+            type.baseName() == "function" && !type.parameters().empty(),
+            "Wasm lambda needs a function signature");
+        combined.push_back(
+            folly::dynamic::object("type", lambda)("nullable", false));
+      }
+      if (variadic)
+        combined.push_back(values[values.size() - 1]);
+      scalarRoot["arguments"] = std::move(combined);
+    }
+    scalarRoot["kind"] = "scalar";
+    scalarRoot["entrypoint"] = requiredString(exports, "update", path);
+    // Version/kind were validated as an aggregate before reusing the scalar
+    // signature parser. ABI 3 cannot be loaded as a scalar declaration.
+    auto scalar = parseScalar(scalarRoot, path, false);
+    initialize = std::move(scalar.initializeEntrypoint);
+    configKeys = std::move(scalar.configKeys);
+    VELOX_USER_CHECK(!initialize.empty(), "Row UDAF requires initialize");
+    signature = std::make_shared<exec::AggregateFunctionSignature>(
+        scalar.signature->variables(),
+        scalar.signature->returnType(),
+        exec::parseTypeSignature(
+            scalarSignatureType(required(root, "intermediate", path), path)),
+        scalar.signature->argumentTypes(),
+        scalar.signature->constantArguments(),
+        scalar.signature->variableArity());
+  } else {
+    arguments = parseArguments(root, path);
+    intermediate =
+        parseManifestType(required(root, "intermediate", path), path);
+    result = parseManifestType(required(root, "return", path), path);
+    VELOX_USER_CHECK(
+        intermediate.type->kind() == TypeKind::VARBINARY,
+        "Legacy Wasm UDAF intermediate type must be varbinary");
+    exec::AggregateFunctionSignatureBuilder builder;
+    builder.returnType(signatureType(result.type));
+    builder.intermediateType(signatureType(intermediate.type));
+    for (const auto& arg : arguments)
+      builder.argumentType(signatureType(arg.type));
+    signature = builder.build();
+  }
+  const bool checkpoint = root.count("state_checkpoint") != 0;
+  if (checkpoint) {
+    VELOX_USER_CHECK_EQ(
+        requiredString(root, "state_checkpoint", path),
+        "owned-v1",
+        "Unsupported Wasm state checkpoint protocol");
+    VELOX_USER_CHECK(
+        rowApi && root["abi_version"].asInt() == kStateAccountingAbiVersion,
+        "Wasm checkpoint requires row aggregate ABI 3");
+  } else {
+    VELOX_USER_CHECK(
+        !exports.count("checkpoint") && !exports.count("restore"),
+        "Wasm checkpoint exports require protocol metadata");
+  }
   return {
-      .abiVersion = kAbiVersion,
+      .abiVersion = static_cast<uint32_t>(root["abi_version"].asInt()),
       .wasmPath = path,
       .name = requiredString(root, "name", path),
       .entrypoints =
@@ -239,13 +539,29 @@ AggregateManifest parseAggregate(
               .mergeSingleGroup =
                   requiredString(exports, "merge_single_group", path),
               .finalize = requiredString(exports, "finalize", path),
+              .toIntermediate = exports.count("to_intermediate")
+                  ? requiredString(exports, "to_intermediate", path)
+                  : "",
+              .compact =
+                  root["abi_version"].asInt() == kStateAccountingAbiVersion
+                  ? requiredString(exports, "compact", path)
+                  : "",
+              .checkpoint =
+                  checkpoint ? requiredString(exports, "checkpoint", path) : "",
+              .restore =
+                  checkpoint ? requiredString(exports, "restore", path) : "",
           },
-      .arguments = parseArguments(root, path),
+      .arguments = std::move(arguments),
       .intermediateType = std::move(intermediate),
-      .returnType = parseManifestType(required(root, "return", path), path),
+      .returnType = std::move(result),
       .orderSensitive = optionalBool(root, "order_sensitive", false),
       .ignoreDuplicates = optionalBool(root, "ignore_duplicates", false),
       .defaultNullBehavior = optionalBool(root, "default_null_behavior", true),
+      .signature = std::move(signature),
+      .initializeEntrypoint = std::move(initialize),
+      .configKeys = std::move(configKeys),
+      .rowApi = rowApi,
+      .lambdaCount = lambdaCount,
   };
 }
 
@@ -270,17 +586,40 @@ uint32_t readU32(
   VELOX_USER_FAIL("Invalid Wasm section length in '{}'", path.string());
 }
 
-std::string readWasm(const std::filesystem::path& path) {
-  std::ifstream input(path, std::ios::binary);
-  VELOX_USER_CHECK(input, "Cannot open Wasm UDF module '{}'", path.string());
-  std::ostringstream contents;
-  contents << input.rdbuf();
-  VELOX_USER_CHECK(
-      !input.bad(), "Cannot read Wasm UDF module '{}'", path.string());
-  return contents.str();
-}
-
 } // namespace
+
+std::string scalarDispatchKey(const exec::FunctionSignature& signature) {
+  std::unordered_map<std::string, std::string> variables;
+  auto canonical = [&](auto&& self,
+                       const exec::TypeSignature& type) -> std::string {
+    const auto& name = type.baseName();
+    std::string key = name;
+    if (auto it = signature.variables().find(name);
+        it != signature.variables().end()) {
+      auto [entry, inserted] =
+          variables.emplace(name, "v" + std::to_string(variables.size()));
+      key = entry->second;
+      const auto& variable = it->second;
+      if (variable.isTypeParameter()) {
+        key += fmt::format(
+            "[type:{},{},{}]",
+            variable.knownTypesOnly(),
+            variable.comparableTypesOnly(),
+            variable.orderableTypesOnly());
+      } else {
+        key += "[integer]";
+      }
+    }
+    key += "(";
+    for (const auto& child : type.parameters())
+      key += self(self, child) + ",";
+    return key + ")";
+  };
+  std::string key = signature.variableArity() ? "variadic:" : "fixed:";
+  for (const auto& argument : signature.argumentTypes())
+    key += canonical(canonical, argument) + ";";
+  return key;
+}
 
 EmbeddedManifests loadEmbeddedManifests(
     const std::filesystem::path& inputPath) {
@@ -291,7 +630,12 @@ EmbeddedManifests loadEmbeddedManifests(
       "Cannot resolve Wasm UDF module '{}': {}",
       inputPath.string(),
       error.message());
-  const auto bytes = readWasm(path);
+  return loadEmbeddedManifests(path, WasmModule::read(path));
+}
+
+EmbeddedManifests loadEmbeddedManifests(
+    const std::filesystem::path& path,
+    std::string_view bytes) {
   VELOX_USER_CHECK(
       bytes.size() >= 8 &&
           bytes.compare(0, 8, std::string_view("\0asm\x01\0\0\0", 8)) == 0,
@@ -300,7 +644,7 @@ EmbeddedManifests loadEmbeddedManifests(
 
   EmbeddedManifests manifests;
   std::unordered_set<std::string> scalarSignatures;
-  std::unordered_set<std::string> aggregateNames;
+  std::unordered_set<std::string> aggregateSignatures;
   size_t metadataBytes = 0;
   size_t offset = 8;
   while (offset < bytes.size()) {
@@ -340,7 +684,8 @@ EmbeddedManifests loadEmbeddedManifests(
           }
           folly::dynamic root;
           try {
-            root = folly::parseJson(bytes.substr(offset, end - offset));
+            root = folly::parseJson(
+                std::string(bytes.substr(offset, end - offset)));
           } catch (const folly::json::parse_error& parseError) {
             VELOX_USER_FAIL(
                 "Invalid Wasm UDF metadata in '{}': {}",
@@ -353,11 +698,9 @@ EmbeddedManifests loadEmbeddedManifests(
               path.string());
           if (root["kind"].asString() == "scalar") {
             auto declaration = parseScalar(root, path);
-            auto signatureKey = declaration.name + "(";
-            for (const auto& argument : declaration.arguments) {
-              signatureKey += argument.type->toString() + ",";
-            }
-            signatureKey += ")";
+            declaration.name = exec::sanitizeName(declaration.name);
+            auto signatureKey = declaration.name + ":" +
+                scalarDispatchKey(*declaration.signature);
             VELOX_USER_CHECK(
                 scalarSignatures.insert(signatureKey).second,
                 "Duplicate Wasm scalar signature '{}' in '{}'",
@@ -366,9 +709,14 @@ EmbeddedManifests loadEmbeddedManifests(
             manifests.scalars.push_back(std::move(declaration));
           } else if (root["kind"].asString() == "aggregate") {
             auto declaration = parseAggregate(root, path);
+            declaration.name = exec::sanitizeName(declaration.name);
             VELOX_USER_CHECK(
-                aggregateNames.insert(declaration.name).second,
-                "Duplicate Wasm aggregate function '{}' in '{}'",
+                aggregateSignatures
+                    .insert(
+                        declaration.name + ":" +
+                        scalarDispatchKey(*declaration.signature))
+                    .second,
+                "Duplicate Wasm aggregate signature '{}' in '{}'",
                 declaration.name,
                 path.string());
             manifests.aggregates.push_back(std::move(declaration));
