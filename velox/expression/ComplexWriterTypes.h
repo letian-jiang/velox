@@ -605,6 +605,50 @@ class MapWriter {
   static constexpr bool std_interface =
       provide_std_interface<K> && provide_std_interface<V>;
 
+  template <typename T, bool allowNull>
+  class IndexedStringWriter {
+   public:
+    IndexedStringWriter(
+        MapWriter* mapWriter,
+        VectorWriter<T, void>* writer,
+        vector_size_t index)
+        : mapWriter_(mapWriter), writer_(writer), index_(index) {}
+
+    void operator=(StringView value) {
+      mapWriter_->commitMostRecentChildItem();
+      writer_->setOffset(index_);
+      writer_->current() = value;
+      writer_->commit(true);
+    }
+
+    void operator=(std::nullopt_t) {
+      static_assert(allowNull, "not allowed to write null to a map key");
+      mapWriter_->commitMostRecentChildItem();
+      writer_->setOffset(index_);
+      writer_->commit(false);
+    }
+
+    void operator=(const std::optional<StringView>& value) {
+      static_assert(allowNull, "not allowed to write null to a map key");
+      if (value.has_value()) {
+        *this = value.value();
+      } else {
+        *this = std::nullopt;
+      }
+    }
+
+   private:
+    MapWriter* mapWriter_;
+    VectorWriter<T, void>* writer_;
+    vector_size_t index_;
+  };
+
+  template <typename T, bool allowNull>
+  using indexed_writer_t = std::conditional_t<
+      has_string_value<T>,
+      IndexedStringWriter<T, allowNull>,
+      PrimitiveWriter<T, allowNull>>;
+
  public:
   // `size` is with respect to the current size of the map being written.
   void reserve(vector_size_t size) {
@@ -706,13 +750,22 @@ class MapWriter {
     length_ = size;
   }
 
-  std::tuple<PrimitiveWriter<K, false>, PrimitiveWriter<V>> operator[](
+  /// Returns assignment proxies for an existing entry in the current map.
+  /// Supports scalar keys and values, including VARCHAR and VARBINARY. String
+  /// assignments copy into the output vector and commit immediately. Call
+  /// resize() before accessing entries that have not been added yet.
+  std::tuple<indexed_writer_t<K, false>, indexed_writer_t<V, true>> operator[](
       vector_size_t index) {
-    static_assert(std_interface, "operator [] not allowed for this map");
+    static_assert(
+        SimpleTypeTrait<K>::isPrimitiveType &&
+            SimpleTypeTrait<V>::isPrimitiveType,
+        "operator [] only supports scalar map keys and values");
+    VELOX_DCHECK_GE(index, 0, "out of bound access");
     VELOX_DCHECK_LT(index, length_, "out of bound access");
+    commitMostRecentChildItem();
     return {
-        PrimitiveWriter<K, false>{keysVector_, innerOffset_ + index},
-        PrimitiveWriter<V>{valuesVector_, innerOffset_ + index}};
+        indexedWriter<K, false>(keysWriter_, index),
+        indexedWriter<V, true>(valuesWriter_, index)};
   }
 
   void emplace(key_element_t key, const std::optional<value_element_t>& value) {
@@ -735,6 +788,17 @@ class MapWriter {
   }
 
  private:
+  template <typename T, bool allowNull>
+  indexed_writer_t<T, allowNull> indexedWriter(
+      VectorWriter<T, void>* writer,
+      vector_size_t index) {
+    if constexpr (has_string_value<T>) {
+      return {this, writer, innerOffset_ + index};
+    } else {
+      return {&writer->vector(), innerOffset_ + index};
+    }
+  }
+
   // Make sure user do not use those.
   MapWriter() = default;
 

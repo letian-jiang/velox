@@ -141,6 +141,87 @@ class MapWriterTest : public functions::test::FunctionBaseTest {
     return writer;
   }
 
+  template <typename TString>
+  void testStringSubscriptAccess() {
+    VectorPtr result =
+        prepareResult(CppToType<Map<TString, TString>>::create(), 2);
+    exec::VectorWriter<Map<TString, TString>> writer;
+    writer.init(*result->as<MapVector>());
+    writer.setOffset(0);
+    auto& mapWriter = writer.current();
+    mapWriter.resize(3);
+
+    const std::string longKey(64, 'k');
+    const std::string longValue(128, 'v');
+    {
+      std::string sourceKey = longKey;
+      std::string sourceValue = longValue;
+      mapWriter[2] =
+          std::make_tuple(StringView(sourceKey), StringView(sourceValue));
+      sourceKey.assign(sourceKey.size(), 'x');
+      sourceValue.assign(sourceValue.size(), 'x');
+    }
+    mapWriter[0] = std::make_tuple(""_sv, ""_sv);
+    {
+      auto [key, value] = mapWriter[1];
+      key = "short"_sv;
+      value = std::nullopt;
+      value = std::optional<StringView>{StringView(longValue)};
+      value = std::optional<StringView>{std::nullopt};
+    }
+
+    // A saved assignment proxy commits a pending append before writing.
+    auto [firstKey, firstValue] = mapWriter[0];
+    {
+      auto [key, value] = mapWriter.add_item();
+      key = "appended_long_key"_sv;
+      value = "appended_long_value"_sv;
+    }
+    firstValue = "indexed_replacement_value"_sv;
+
+    // Sequential writes reuse the string buffers after indexed writes.
+    {
+      auto [key, value] = mapWriter.add_item();
+      key = "last_appended_long_key"_sv;
+      value = "last_appended_long_value"_sv;
+    }
+    writer.commit();
+
+    writer.setOffset(1);
+    mapWriter.resize(2);
+    mapWriter[1] = std::make_tuple("a\0b"_sv, "value\0with\0nulls"_sv);
+    mapWriter[0] = std::make_tuple("second_row"_sv, ""_sv);
+    writer.commit();
+    writer.finish();
+
+    const std::vector<map_pairs_t<std::string, std::string>> expected = {
+        {{"", "indexed_replacement_value"},
+         {"short", std::nullopt},
+         {longKey, longValue},
+         {"appended_long_key", "appended_long_value"},
+         {"last_appended_long_key", "last_appended_long_value"}},
+        {{"second_row", ""},
+         {std::string("a\0b", 3), std::string("value\0with\0nulls", 16)}}};
+
+    DecodedVector decoded;
+    decoded.decode(*result, SelectivityVector(result->size()));
+    exec::VectorReader<Map<TString, TString>> reader(&decoded);
+    for (vector_size_t row = 0; row < expected.size(); ++row) {
+      const auto map = reader[row];
+      ASSERT_EQ(map.size(), expected[row].size());
+      vector_size_t index = 0;
+      for (const auto [key, value] : map) {
+        EXPECT_EQ(key, StringView(expected[row][index].first));
+        const auto& expectedValue = expected[row][index].second;
+        ASSERT_EQ(value.has_value(), expectedValue.has_value());
+        if (expectedValue.has_value()) {
+          EXPECT_EQ(value.value(), StringView(expectedValue.value()));
+        }
+        ++index;
+      }
+    }
+  }
+
  protected:
   static void SetUpTestCase() {
     FunctionBaseTest::SetUpTestCase();
@@ -289,6 +370,45 @@ TEST_F(MapWriterTest, resizeAndSubscriptAccess) {
       {5, 6},
       {6, std::nullopt}};
   assertEqualVectors(result, makeMapVector<int64_t, int64_t>({expected}));
+}
+
+TEST_F(MapWriterTest, stringSubscriptAccess) {
+  testStringSubscriptAccess<Varchar>();
+  testStringSubscriptAccess<Varbinary>();
+}
+
+TEST_F(MapWriterTest, varcharKeySubscriptAccess) {
+  auto result = prepareResult(MAP(VARCHAR(), INTEGER()), 2);
+  exec::VectorWriter<Map<Varchar, int32_t>> writer;
+  writer.init(*result->as<MapVector>());
+
+  for (vector_size_t row = 0; row < 2; ++row) {
+    writer.setOffset(row);
+    auto& mapWriter = writer.current();
+    mapWriter.resize(64);
+    for (vector_size_t index = 63; index >= 0; --index) {
+      const auto key = fmt::format("long_string_key_{}_{}", row, index);
+      auto [keyWriter, valueWriter] = mapWriter[index];
+      keyWriter = StringView(key);
+      valueWriter = index;
+    }
+    writer.commit();
+  }
+  writer.finish();
+
+  // Compare in physical order to check that each entry occupies its index.
+  const auto map = result->as<MapVector>();
+  const auto keys = map->mapKeys()->asFlatVector<StringView>();
+  const auto values = map->mapValues()->asFlatVector<int32_t>();
+  for (vector_size_t row = 0; row < 2; ++row) {
+    ASSERT_EQ(map->sizeAt(row), 64);
+    for (vector_size_t index = 0; index < 64; ++index) {
+      const auto expectedKey = fmt::format("long_string_key_{}_{}", row, index);
+      EXPECT_EQ(
+          keys->valueAt(map->offsetAt(row) + index), StringView(expectedKey));
+      EXPECT_EQ(values->valueAt(map->offsetAt(row) + index), index);
+    }
+  }
 }
 
 TEST_F(MapWriterTest, e2ePrimitives) {

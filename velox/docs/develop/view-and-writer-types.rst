@@ -279,16 +279,33 @@ When V is primitive, the following functions are available, making the writer us
 - std::tuple<out_type<K>&, out_type<V>&> **add_item()** : add non-null item and return the writers of key and value as tuple.
 - out_type<K>& **add_null()** : add null item and return the key writer.
 - vector_size_t **size** (): return the length of the map.
+- **resize** (vector_size_t size): change the size, reserving space for new entries if needed.
 
 - void **add_items** (const T& data): append data from any container with std::vector<tuple<K, V>> like interface.
 - void **copy_from** (const NullFreeMapView<V>& data): assign data from map view (faster than item by item).
 - void **copy_from** (const NullableMapView<V>& data): assign data from map view (faster than item by item).
 
-When K and V are primitives, the following functions are available, making the writer usable as std::vector<std::tuple<K, V>>.
+When K and V are scalar types, including VARCHAR and VARBINARY, **operator[]**
+(vector_size_t index) returns a tuple of assignment proxies for the key and value
+at index. The key proxy accepts a non-null native value. The value proxy accepts
+a native value, an optional native value, or std::nullopt. String proxies accept
+StringView values, copy the string into the output vector, and commit the write
+immediately.
 
-- **resize** (vector_size_t size): change the size.
-- **emplace** (K, std::optional<V>): add element to the map.
-- std::tuple<K&, PrimitiveWriter<V>> **operator[]** (vector_size_t index): returns pair of writers for element at index. Key writer is assignable to K. while value writer is assignable to std::optional<V>.
+Call **resize** before writing new entries by index. Entries may be filled in any
+order. Indices are relative to the current map, and assignment proxies must be
+used before moving to another output row. Indexed assignments may be mixed with
+**add_item()** and **add_null()**.
+
+.. code-block:: c++
+
+    // out_type<Map<Varchar, int32_t>>& out
+    out.resize(2);
+    out[1] = std::make_tuple("second"_sv, 2);
+    out[0] = std::make_tuple("first"_sv, 1);
+
+When K and V are non-string primitive types, **emplace** (K, std::optional<V>)
+adds an entry to the map.
 
 **RowWriter<T...>**
 
