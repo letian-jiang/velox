@@ -34,6 +34,7 @@ velox_add_library(
   ArrayDistinct.cpp
   ArrayDuplicates.cpp
   ArrayFlatten.cpp
+  ArrayFrequency.cpp
   ArrayIntersectExcept.cpp
   ArrayAndMapMatch.cpp
   ArrayMinMaxBy.cpp
