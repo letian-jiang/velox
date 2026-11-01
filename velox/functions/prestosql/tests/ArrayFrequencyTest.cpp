@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-#include "velox/functions/prestosql/ArrayFunctions.h"
+#include <cmath>
+
 #include "velox/functions/prestosql/tests/utils/FunctionBaseTest.h"
 
 using facebook::velox::test::assertEqualVectors;
@@ -25,38 +26,17 @@ namespace {
 
 class ArrayFrequencyTest : public functions::test::FunctionBaseTest {
  protected:
-  static void SetUpTestCase() {
-    FunctionBaseTest::SetUpTestCase();
-    registerFunction<
-        ParameterBinder<ArrayFrequencyFunction, int64_t>,
-        Map<int64_t, int32_t>,
-        Array<int64_t>>({"frequency_reference_bigint"});
-    registerFunction<
-        ParameterBinder<ArrayFrequencyFunction, Varchar>,
-        Map<Varchar, int32_t>,
-        Array<Varchar>>({"frequency_reference_varchar"});
-  }
-
-  void testArrayFrequency(const VectorPtr& expected, const VectorPtr& input) {
-    auto result =
-        evaluate<BaseVector>("array_frequency(C0)", makeRowVector({input}));
-    assertEqualVectors(expected, result);
-  }
-
-  VectorPtr check(const VectorPtr& input) {
-    const auto type = input->type()->childAt(0);
-    const auto name = type->isBigint() ? "frequency_reference_bigint"
-                                       : "frequency_reference_varchar";
-    auto data = makeRowVector({input});
-    auto expected = evaluate(std::string(name) + "(c0)", data);
-    auto actual = evaluate("array_frequency(c0)", data);
+  VectorPtr testArrayFrequency(
+      const VectorPtr& expected,
+      const VectorPtr& input) {
+    auto actual = evaluate("array_frequency(c0)", makeRowVector({input}));
     assertEqualVectors(expected, actual);
     DecodedVector expectedRows(*expected);
     DecodedVector actualRows(*actual);
     const auto* expectedMap = expectedRows.base()->as<MapVector>();
     const auto* actualMap = actualRows.base()->as<MapVector>();
     for (vector_size_t row = 0; row < input->size(); ++row) {
-      if (actual->isNullAt(row)) {
+      if (expected->isNullAt(row)) {
         continue;
       }
       const auto expectedRow = expectedRows.index(row);
@@ -69,6 +49,42 @@ class ArrayFrequencyTest : public functions::test::FunctionBaseTest {
       }
     }
     return actual;
+  }
+
+  template <typename T>
+  void testIntegralType() {
+    const auto minimum = std::numeric_limits<T>::min();
+    const auto maximum = std::numeric_limits<T>::max();
+    auto input = makeNullableArrayVector<T>(
+        {{3, 1, 3, std::nullopt, minimum, maximum, minimum},
+         {},
+         {std::nullopt}});
+    auto expected = makeMapVector<T, int32_t>(
+        {{{3, 2}, {1, 1}, {minimum, 2}, {maximum, 1}}, {}, {}});
+    testArrayFrequency(expected, input);
+  }
+
+  template <typename T>
+  void testFloatingPointType() {
+    const auto nan = std::numeric_limits<T>::quiet_NaN();
+    const auto infinity = std::numeric_limits<T>::infinity();
+    auto input = makeNullableArrayVector<T>(
+        {{nan, nan},
+         {2, nan, 2, infinity, -infinity, infinity, std::nullopt, -nan},
+         {-0.0, 0.0, -0.0},
+         {0.0, -0.0},
+         {}});
+    auto expected = makeMapVector<T, int32_t>(
+        {{},
+         {{2, 2}, {infinity, 2}, {-infinity, 1}},
+         {{-0.0, 3}},
+         {{0.0, 2}},
+         {}});
+    VectorPtr result = testArrayFrequency(expected, input);
+    const auto* map = result->as<MapVector>();
+    const auto* keys = map->mapKeys()->asFlatVector<T>();
+    EXPECT_TRUE(std::signbit(keys->valueAt(map->offsetAt(2))));
+    EXPECT_FALSE(std::signbit(keys->valueAt(map->offsetAt(3))));
   }
 };
 
@@ -90,7 +106,7 @@ TEST_F(ArrayFrequencyTest, integerArray) {
         0}});
 
   auto expected = makeMapVector<int64_t, int>(
-      {{{1, 2}, {2, 1}, {-2, 1}},
+      {{{2, 1}, {1, 2}, {-2, 1}},
        {},
        {{1, 5}, {2, 1}},
        {{-1, 3}},
@@ -104,7 +120,7 @@ TEST_F(ArrayFrequencyTest, integerArrayWithoutNull) {
       makeArrayVector<int64_t>({{2, 1, 1, -2}, {}, {1, 2, 1, 1, 1, 1}});
 
   auto expected = makeMapVector<int64_t, int>(
-      {{{1, 2}, {2, 1}, {-2, 1}}, {}, {{1, 5}, {2, 1}}});
+      {{{2, 1}, {1, 2}, {-2, 1}}, {}, {{1, 5}, {2, 1}}});
 
   testArrayFrequency(expected, array);
 }
@@ -144,53 +160,86 @@ TEST_F(ArrayFrequencyTest, varcharArrayWithoutNull) {
   testArrayFrequency(expected, array);
 }
 
-TEST_F(ArrayFrequencyTest, legacyIntegerType) {
-  auto input = makeArrayVector<int32_t>({{3, 1, 3, 2}, {}, {9, 9}});
-  auto expected =
-      makeMapVector<int32_t, int32_t>({{{3, 2}, {1, 1}, {2, 1}}, {}, {{9, 2}}});
-  testArrayFrequency(expected, input);
+TEST_F(ArrayFrequencyTest, scalarTypes) {
+  testIntegralType<int8_t>();
+  testIntegralType<int16_t>();
+  testIntegralType<int32_t>();
+  testIntegralType<int128_t>();
+
+  testArrayFrequency(
+      makeMapVector<bool, int32_t>({{{true, 2}, {false, 1}}, {}, {}}),
+      makeNullableArrayVector<bool>(
+          {{true, false, std::nullopt, true}, {}, {std::nullopt}}));
+
+  testArrayFrequency(
+      makeMapVector<int32_t, int32_t>(
+          {{{3, 2}, {1, 1}}, {}, {}}, MAP(DATE(), INTEGER())),
+      makeNullableArrayVector<int32_t>(
+          {{3, 1, std::nullopt, 3}, {}, {std::nullopt}}, ARRAY(DATE())));
+
+  testArrayFrequency(
+      makeMapVector<Timestamp, int32_t>(
+          {{{Timestamp(3, 1), 2}, {Timestamp(3, 2), 1}}, {}, {}}),
+      makeNullableArrayVector<Timestamp>(
+          {{Timestamp(3, 1), Timestamp(3, 2), std::nullopt, Timestamp(3, 1)},
+           {},
+           {std::nullopt}}));
+}
+
+TEST_F(ArrayFrequencyTest, floatingPointArray) {
+  testFloatingPointType<float>();
+  testFloatingPointType<double>();
 }
 
 TEST_F(ArrayFrequencyTest, emptyNullAndRehash) {
   auto array = makeNullableArrayVector<int64_t>(
       {{3, 1, 3, std::nullopt, 2, 1}, {}, {std::nullopt}, {9, 9}});
   array->setNull(3, true);
-  auto result = check(array);
-  DecodedVector decoded(*result);
-  const auto* map = decoded.base()->as<MapVector>();
-  ASSERT_NE(map, nullptr);
-  EXPECT_TRUE(map->mapKeys()->isFlatEncoding());
-  BaseVector::flattenVector(result);
-  EXPECT_TRUE(result->as<MapVector>()->mapKeys()->isFlatEncoding());
-  assertEqualVectors(
-      evaluate("array_frequency(c0)", makeRowVector({array})), result);
+  auto expected =
+      makeMapVector<int64_t, int32_t>({{{3, 2}, {1, 2}, {2, 1}}, {}, {}, {}});
+  expected->setNull(3, true);
+  testArrayFrequency(expected, array);
 
-  check(makeArrayVector<int64_t>(
-      8, [](auto) { return 2048; }, [](auto i) { return int64_t(i % 1024); }));
+  testArrayFrequency(
+      makeMapVector<int64_t, int32_t>(
+          8,
+          [](auto) { return 1024; },
+          [](auto i) { return int64_t(i % 1024); },
+          [](auto) { return 2; }),
+      makeArrayVector<int64_t>(
+          8,
+          [](auto) { return 2048; },
+          [](auto i) { return int64_t(i % 1024); }));
 }
 
 TEST_F(ArrayFrequencyTest, encodedArraysAndElements) {
   auto array = makeNullableArrayVector<int64_t>(
       {{3, 1, 3, std::nullopt}, {2, 2, 2}, {}, {9, 8, 9, 8}});
-  // Use a non-identity mapping plus a dictionary null independent of the
-  // underlying vector's nulls. Output indices must address this wrapper.
-  const auto n = array->elements()->size();
+  // Combine a reversed dictionary with nulls in its wrapper and base.
+  const auto numElements = array->elements()->size();
   array->setElements(BaseVector::wrapInDictionary(
-      makeNulls(n, [](auto i) { return i == 1; }),
-      makeIndices(n, [n](auto i) { return n - 1 - i; }),
-      n,
+      makeNulls(numElements, [](auto i) { return i == 1; }),
+      makeIndices(
+          numElements, [numElements](auto i) { return numElements - 1 - i; }),
+      numElements,
       array->elements()));
-  auto dictionary = BaseVector::wrapInDictionary(
-      nullptr, makeIndices(7, [](auto i) { return (i * 3) % 4; }), 7, array);
-  auto result = check(dictionary);
-  BaseVector::flattenVector(result);
-  assertEqualVectors(
-      evaluate("array_frequency(c0)", makeRowVector({dictionary})), result);
-  check(BaseVector::wrapInConstant(7, 1, array));
-  check(BaseVector::wrapInConstant(7, 2, array));
+  auto expected = makeMapVector<int64_t, int32_t>(
+      {{{8, 2}, {9, 1}}, {{2, 3}}, {}, {{3, 2}, {1, 1}}});
+  auto indices = makeIndices(7, [](auto i) { return (i * 3) % 4; });
+  testArrayFrequency(
+      BaseVector::wrapInDictionary(nullptr, indices, 7, expected),
+      BaseVector::wrapInDictionary(nullptr, indices, 7, array));
+  for (vector_size_t row : {1, 2}) {
+    testArrayFrequency(
+        BaseVector::wrapInConstant(7, row, expected),
+        BaseVector::wrapInConstant(7, row, array));
+  }
 
-  array->setElements(BaseVector::wrapInConstant(12, 0, array->elements()));
-  check(array);
+  array->setElements(
+      BaseVector::wrapInConstant(numElements, 0, array->elements()));
+  testArrayFrequency(
+      makeMapVector<int64_t, int32_t>({{{8, 4}}, {{8, 3}}, {}, {{8, 4}}}),
+      array);
 }
 
 TEST_F(ArrayFrequencyTest, stringsSurviveInputReleaseAndFlatten) {
@@ -201,12 +250,12 @@ TEST_F(ArrayFrequencyTest, stringsSurviveInputReleaseAndFlatten) {
         std::nullopt},
        {"short"_sv, "short"_sv},
        {}});
-  auto result = check(array);
   auto expected = makeMapVector<StringView, int32_t>(
       {{{"a long string outside StringView inline storage"_sv, 2},
         {"another long string outside inline storage"_sv, 1}},
        {{"short"_sv, 2}},
        {}});
+  auto result = testArrayFrequency(expected, array);
   array.reset();
   assertEqualVectors(expected, result);
   BaseVector::flattenVector(result);
@@ -220,10 +269,13 @@ TEST_F(ArrayFrequencyTest, conditionalRowsAndExistingResult) {
       {{8}, {6, 6, 1}, {std::nullopt}, {}, {4}, {2, 3, 2}});
   auto data =
       makeRowVector({makeFlatVector<int64_t>({0, 1, 2, 3, 4, 5}), left, right});
-  auto expected = evaluate(
-      "if(c0 % 2 = 0, frequency_reference_bigint(c1), "
-      "frequency_reference_bigint(c2))",
-      data);
+  auto expected = makeMapVector<int64_t, int32_t>(
+      {{{3, 2}, {1, 1}},
+       {{6, 2}, {1, 1}},
+       {},
+       {},
+       {{4, 2}, {5, 1}},
+       {{2, 2}, {3, 1}}});
   auto actual = evaluate(
       "if(c0 % 2 = 0, array_frequency(c1), array_frequency(c2))", data);
   assertEqualVectors(expected, actual);

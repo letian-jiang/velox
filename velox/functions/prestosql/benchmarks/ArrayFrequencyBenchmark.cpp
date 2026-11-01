@@ -31,8 +31,38 @@ namespace {
 
 constexpr vector_size_t kBatchSize = 256;
 
-template <typename TExec, typename T>
-struct ArrayFrequencyBaseline : functions::ArrayFrequencyFunction<TExec, T> {};
+// Original two-pass implementation used as a performance baseline.
+template <typename TExecParams, typename T>
+struct ArrayFrequencyBaseline {
+  VELOX_DEFINE_FUNCTION_TYPES(TExecParams);
+
+  FOLLY_ALWAYS_INLINE void call(
+      out_type<Map<T, int>>& out,
+      arg_type<Array<T>> inputArray) {
+    frequencyCount_.clear();
+
+    for (const auto& item : inputArray.skipNulls()) {
+      frequencyCount_[item]++;
+    }
+
+    // To make the output order of key value pairs deterministic (since F14
+    // does not provide ordering guarantees), we do another iteration in the
+    // input and look up element frequencies in the F14 map. To prevent
+    // duplicates in the output, we remove the keys we already added.
+    for (const auto& item : inputArray.skipNulls()) {
+      auto it = frequencyCount_.find(item);
+      if (it != frequencyCount_.end()) {
+        auto [keyWriter, valueWriter] = out.add_item();
+        keyWriter = item;
+        valueWriter = it->second;
+        frequencyCount_.erase(it);
+      }
+    }
+  }
+
+ private:
+  folly::F14FastMap<arg_type<T>, int> frequencyCount_;
+};
 
 template <typename T>
 void registerFunctions() {
@@ -41,7 +71,7 @@ void registerFunctions() {
       Map<T, int32_t>,
       Array<T>>({"array_frequency_baseline"});
   registerFunction<
-      ParameterBinder<functions::ArrayFrequencyIndexedFunction, T>,
+      ParameterBinder<functions::ArrayFrequencyFunction, T>,
       Map<T, int32_t>,
       Array<T>>({"array_frequency"});
 }

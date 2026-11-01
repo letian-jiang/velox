@@ -104,12 +104,10 @@ template <typename T>
 inline void registerArrayFrequencyFunctions(
     const std::string& prefix,
     std::string_view defaultOwner) {
-  using Function = std::conditional_t<
-      std::is_same_v<T, int64_t> || std::is_same_v<T, Varchar>,
-      ParameterBinder<ArrayFrequencyIndexedFunction, T>,
-      ParameterBinder<ArrayFrequencyFunction, T>>;
-  registerFunction<Function, Map<T, int>, Array<T>>(
-      {prefix + "array_frequency"}, true, defaultOwner);
+  registerFunction<
+      ParameterBinder<ArrayFrequencyFunction, T>,
+      Map<T, int>,
+      Array<T>>({prefix + "array_frequency"}, true, defaultOwner);
 }
 
 template <typename T>

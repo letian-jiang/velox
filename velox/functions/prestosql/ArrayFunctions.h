@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <cmath>
 #include <type_traits>
 
 #include "velox/expression/ComplexViewTypes.h"
@@ -594,43 +595,9 @@ struct ArrayHasDuplicatesFunction {
   }
 };
 
-// Function Signature: array<T> -> map<T, int>, where T is ("bigint", "varchar")
-// Returns a map with frequency of each element in the input array vector.
+// Returns element frequencies in first-occurrence order, ignoring nulls.
 template <typename TExecParams, typename T>
 struct ArrayFrequencyFunction {
-  VELOX_DEFINE_FUNCTION_TYPES(TExecParams);
-
-  FOLLY_ALWAYS_INLINE void call(
-      out_type<velox::Map<T, int>>& out,
-      arg_type<velox::Array<T>> inputArray) {
-    frequencyCount_.clear();
-
-    for (const auto& item : inputArray.skipNulls()) {
-      frequencyCount_[item]++;
-    }
-
-    // To make the output order of key value pairs deterministic (since F14
-    // does not provide ordering guarantees), we do another iteration in the
-    // input and look up element frequencies in the F14 map. To prevent
-    // duplicates in the output, we remove the keys we already added.
-    for (const auto& item : inputArray.skipNulls()) {
-      auto it = frequencyCount_.find(item);
-      if (it != frequencyCount_.end()) {
-        auto [keyWriter, valueWriter] = out.add_item();
-        keyWriter = item;
-        valueWriter = it->second;
-        frequencyCount_.erase(it);
-      }
-    }
-  }
-
- private:
-  folly::F14FastMap<arg_type<T>, int> frequencyCount_;
-};
-
-// Preserve first-occurrence order using indexed output writes.
-template <typename TExecParams, typename T>
-struct ArrayFrequencyIndexedFunction {
   VELOX_DEFINE_FUNCTION_TYPES(TExecParams);
 
   FOLLY_ALWAYS_INLINE void call(
@@ -638,6 +605,12 @@ struct ArrayFrequencyIndexedFunction {
       arg_type<velox::Array<T>> inputArray) {
     frequencyCount_.clear();
     for (const auto& item : inputArray.skipNulls()) {
+      if constexpr (std::is_floating_point_v<T>) {
+        // NaN keys are omitted from the result.
+        if (std::isnan(item)) {
+          continue;
+        }
+      }
       auto iterator =
           frequencyCount_
               .try_emplace(
@@ -647,6 +620,8 @@ struct ArrayFrequencyIndexedFunction {
       ++iterator->second.frequency;
     }
 
+    // Each entry carries its first-occurrence position so output order does
+    // not depend on the hash table's iteration order.
     out.resize(frequencyCount_.size());
     for (const auto& [key, count] : frequencyCount_) {
       out[count.index] = std::make_tuple(key, count.frequency);
