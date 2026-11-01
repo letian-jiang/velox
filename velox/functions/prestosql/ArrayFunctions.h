@@ -628,6 +628,40 @@ struct ArrayFrequencyFunction {
   folly::F14FastMap<arg_type<T>, int> frequencyCount_;
 };
 
+// Preserve first-occurrence order using indexed output writes.
+template <typename TExecParams, typename T>
+struct ArrayFrequencyIndexedFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(TExecParams);
+
+  FOLLY_ALWAYS_INLINE void call(
+      out_type<velox::Map<T, int32_t>>& out,
+      arg_type<velox::Array<T>> inputArray) {
+    frequencyCount_.clear();
+    for (const auto& item : inputArray.skipNulls()) {
+      auto iterator =
+          frequencyCount_
+              .try_emplace(
+                  item,
+                  Count{0, static_cast<vector_size_t>(frequencyCount_.size())})
+              .first;
+      ++iterator->second.frequency;
+    }
+
+    out.resize(frequencyCount_.size());
+    for (const auto& [key, count] : frequencyCount_) {
+      out[count.index] = std::make_tuple(key, count.frequency);
+    }
+  }
+
+ private:
+  struct Count {
+    int32_t frequency;
+    vector_size_t index;
+  };
+
+  folly::F14FastMap<arg_type<T>, Count> frequencyCount_;
+};
+
 template <typename TExecParams, typename T>
 struct ArrayNormalizeFunction {
   VELOX_DEFINE_FUNCTION_TYPES(TExecParams);

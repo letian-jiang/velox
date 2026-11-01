@@ -22,12 +22,6 @@
 #include "velox/benchmarks/ExpressionBenchmarkBuilder.h"
 #include "velox/functions/prestosql/ArrayFunctions.h"
 
-namespace facebook::velox::functions {
-void registerArrayFrequencyBenchmarkFunction() {
-  VELOX_REGISTER_VECTOR_FUNCTION(udf_array_frequency, "array_frequency");
-}
-} // namespace facebook::velox::functions
-
 using namespace facebook::velox;
 
 DEFINE_bool(validate_only, false, "Check results and order without timing");
@@ -46,6 +40,10 @@ void registerFunctions() {
       ParameterBinder<ArrayFrequencyBaseline, T>,
       Map<T, int32_t>,
       Array<T>>({"array_frequency_baseline"});
+  registerFunction<
+      ParameterBinder<functions::ArrayFrequencyIndexedFunction, T>,
+      Map<T, int32_t>,
+      Array<T>>({"array_frequency"});
 }
 
 void verifyResults(
@@ -97,8 +95,7 @@ void addCase(
   auto input = builder.vectorMaker().rowVector({array});
   verifyResults(builder, input);
   std::vector<std::pair<std::string, std::string>> variants = {
-      {"baseline", "array_frequency_baseline"},
-      {"dictionary", "array_frequency"}};
+      {"baseline", "array_frequency_baseline"}, {"indexed", "array_frequency"}};
   if (FLAGS_variant_order != 0) {
     std::reverse(variants.begin(), variants.end());
   }
@@ -192,7 +189,6 @@ int main(int argc, char** argv) {
   registerFunctions<int64_t>();
   registerFunctions<Varchar>();
 
-  functions::registerArrayFrequencyBenchmarkFunction();
   ExpressionBenchmarkBuilder builder;
   addCases(builder);
   builder.testBenchmarks();

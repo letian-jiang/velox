@@ -104,10 +104,12 @@ template <typename T>
 inline void registerArrayFrequencyFunctions(
     const std::string& prefix,
     std::string_view defaultOwner) {
-  registerFunction<
-      ParameterBinder<ArrayFrequencyFunction, T>,
-      Map<T, int>,
-      Array<T>>({prefix + "array_frequency"}, true, defaultOwner);
+  using Function = std::conditional_t<
+      std::is_same_v<T, int64_t> || std::is_same_v<T, Varchar>,
+      ParameterBinder<ArrayFrequencyIndexedFunction, T>,
+      ParameterBinder<ArrayFrequencyFunction, T>>;
+  registerFunction<Function, Map<T, int>, Array<T>>(
+      {prefix + "array_frequency"}, true, defaultOwner);
 }
 
 template <typename T>
@@ -198,8 +200,6 @@ void registerArrayFunctions(
 
   VELOX_REGISTER_VECTOR_FUNCTION_WITH_OWNER(
       udf_array_distinct, prefix + "array_distinct", defaultOwner);
-  VELOX_REGISTER_VECTOR_FUNCTION_WITH_OWNER(
-      udf_array_frequency, prefix + "array_frequency", defaultOwner);
   VELOX_REGISTER_VECTOR_FUNCTION_WITH_OWNER(
       udf_array_duplicates, prefix + "array_duplicates", defaultOwner);
   VELOX_REGISTER_VECTOR_FUNCTION_WITH_OWNER(
@@ -421,11 +421,13 @@ void registerArrayFunctions(
   registerArrayFrequencyFunctions<int8_t>(prefix, defaultOwner);
   registerArrayFrequencyFunctions<int16_t>(prefix, defaultOwner);
   registerArrayFrequencyFunctions<int32_t>(prefix, defaultOwner);
+  registerArrayFrequencyFunctions<int64_t>(prefix, defaultOwner);
   registerArrayFrequencyFunctions<int128_t>(prefix, defaultOwner);
   registerArrayFrequencyFunctions<float>(prefix, defaultOwner);
   registerArrayFrequencyFunctions<double>(prefix, defaultOwner);
   registerArrayFrequencyFunctions<Timestamp>(prefix, defaultOwner);
   registerArrayFrequencyFunctions<Date>(prefix, defaultOwner);
+  registerArrayFrequencyFunctions<Varchar>(prefix, defaultOwner);
 
   registerArrayNormalizeFunctions<int8_t>(prefix, defaultOwner);
   registerArrayNormalizeFunctions<int16_t>(prefix, defaultOwner);

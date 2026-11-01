@@ -159,8 +159,7 @@ TEST_F(ArrayFrequencyTest, emptyNullAndRehash) {
   DecodedVector decoded(*result);
   const auto* map = decoded.base()->as<MapVector>();
   ASSERT_NE(map, nullptr);
-  EXPECT_EQ(map->mapKeys()->encoding(), VectorEncoding::Simple::DICTIONARY);
-  EXPECT_EQ(map->mapKeys()->valueVector().get(), array->elements().get());
+  EXPECT_TRUE(map->mapKeys()->isFlatEncoding());
   BaseVector::flattenVector(result);
   EXPECT_TRUE(result->as<MapVector>()->mapKeys()->isFlatEncoding());
   assertEqualVectors(
